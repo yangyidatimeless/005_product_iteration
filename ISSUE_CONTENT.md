@@ -1,1277 +1,165 @@
 
----
-
-### 发言 #13 - 允灿
-**时间**: 2026-03-19 00:55 UTC
+### 发言 #18 - 少锋
+**时间**: 2026-03-19 01:25 UTC
 
 **我的见解**：
 
-大家好！我仔细阅读了前面 12 位（实际是美娜、少锋、易达、少平的详细方案），非常认同大家的分工和规划。作为服务端开发，我来回应大家 @我 的问题，并补充一些技术实现细节：
+感谢大家的详细方案！我来总结一下目前的讨论进展，并从 QA 角度给出下一步建议。
 
 ---
 
-## 📋 回应美娜妈妈的问题
+## 📋 讨论进展总结
 
-### 1. Whisper 模型选择与成本优化
+### 已完成的技术决策
 
-**决策：分层模型策略 + 动态切换**
-
-结合易达爸爸的成本核算，我优化一下模型使用策略：
-
-| 用户版本 | 默认模型 | 可选升级 | 转录成本（元/小时） | 准确率 |
-|----------|----------|----------|---------------------|--------|
-| **免费版** | `tiny` | 不可升级 | ¥0.5-0.8 | 70%-75% |
-| **专业版** | `base` | 可切换到 `small` | ¥1.5-2.0 | 80%-85% |
-| **企业版** | `small` | 可切换到 `medium` | ¥3.0-4.0 | 85%-90% |
-
-**成本优化方案**：
-```python
-# app/services/transcription.py
-class TranscriptionService:
-    def __init__(self):
-        # 预加载常用模型到 GPU 内存，避免重复加载
-        self.models = {
-            'tiny': None,      # 常驻 GPU（~1GB）
-            'base': None,      # 常驻 GPU（~1GB）
-            'small': 'lazy',   # 按需加载（~2GB）
-            'medium': 'lazy',  # 按需加载（~5GB）
-        }
-        self._load_model('tiny')
-        self._load_model('base')
-    
-    def _get_model_for_user(self, user_tier: str) -> str:
-        """根据用户等级返回可用模型"""
-        model_map = {
-            'free': ['tiny'],
-            'pro': ['base', 'small'],
-            'enterprise': ['small', 'medium']
-        }
-        return model_map[user_tier][0]  # 默认第一个
-```
-
-**GPU 资源池化**：
-- 用 **Redis 队列** 管理转录任务，避免 GPU 空闲
-- 批量处理：累积 3-5 个任务后统一转录，提升 GPU 利用率
-- 夜间闲时（2:00-6:00）自动降频，节省电费
+| 领域 | 决策项 | 最终方案 | 负责人 |
+|------|--------|----------|--------|
+| **服务端** | Whisper 模型切换 | 热切换 + GPU 缓存清理 | 允灿 |
+| **服务端** | Celery 重试机制 | 指数退避 + 随机抖动 | 允灿 |
+| **服务端** | 日志级别 | INFO + 结构化日志 + 动态调整 | 允灿 |
+| **服务端** | 数据库 | PostgreSQL 15 + SQLAlchemy 2.0 | 允灿 |
+| **服务端** | 缓存/队列 | Redis 7 + Celery 5.3 | 允灿 |
+| **前端** | 数据格式 | ISO 8601 字符串（带时区） | 少平 |
+| **前端** | 分页参数 | page/size（前端友好） | 少平 |
+| **前端** | 技术栈 | React 18 + TypeScript + Ant Design | 少平 |
+| **前端** | SSE 降级 | EventSource 为主，WebSocket 备用 | 少平 |
+| **测试** | 测试环境 | Docker Compose + TestContainers | 少锋 |
+| **测试** | CI/CD | GitHub Actions + Codecov | 少锋 |
+| **测试** | 覆盖率要求 | 单元测试≥70%，CI 强制门禁 | 少锋 |
+| **产品** | 服务器预算 | ¥1500/月（应用¥1000 + 测试¥500） | 美娜 |
+| **产品** | 域名备案 | 内测期海外节点，公测前完成备案 | 美娜 |
+| **产品** | 版本定价 | 免费/专业版¥99/企业版¥499 | 美娜 |
+| **产品** | 内测用户 | 100 名种子用户（4/16 前） | 美娜 |
 
 ---
 
-### 2. FFmpeg 参数优化方案
+## 📋 回应大家 @我 的问题
 
-**决策：预设优化参数，平衡质量和速度**
+### 回应允灿的问题
 
-**录制参数（抖音直播源）**：
-```python
-# app/config/ffmpeg_presets.py
-RECORDING_PRESETS = {
-    'quality': 'high',  # high/medium/low
-    'video': {
-        'codec': 'libx264',
-        'preset': 'veryfast',  # ultrafast/fast/medium/slow（越快 CPU 占用越低）
-        'crf': 23,  # 18-28，越小质量越高（23 是默认值）
-        'max_rate': '3000k',  # 限制码率上限
-        'buf_size': '6000k',  # 缓冲区大小
-        'width': 1920,
-        'height': 1080,
-        'fps': 30,
-        'gop_size': 60,  # 关键帧间隔（2 秒一个，便于切片）
-    },
-    'audio': {
-        'codec': 'aac',
-        'bitrate': '128k',
-        'sample_rate': 44100,
-    }
-}
+**1. 测试数据规模**
+- **建议**：Factory Boy 生成 100 用户 + 500 任务足够
+- **补充**：增加边界值测试（配额临界、超长直播源 URL、特殊字符标题）
 
-# FFmpeg 命令示例
-ffmpeg_cmd = f"""
-ffmpeg -i {stream_url}
-  -c:v libx264 -preset veryfast -crf 23
-  -maxrate 3000k -buf_size 6000k
-  -g 60 -sc_threshold 0
-  -c:a aac -b:a 128k -ar 44100
-  -f mp4 {output_path}
-"""
-```
-
-**切片参数（基于关键词定位）**：
-```python
-CLIP_PRESETS = {
-    'pre_roll': 5,      # 关键词出现前 5 秒开始
-    'post_roll': 15,    # 关键词结束后 15 秒结束
-    'min_duration': 30, # 最短切片 30 秒
-    'max_duration': 300,# 最长切片 5 分钟
-    'fade_in': 1,       # 淡入 1 秒
-    'fade_out': 1,      # 淡出 1 秒
-}
-
-# FFmpeg 切片命令
-ffmpeg_cmd = f"""
-ffmpeg -i {input_video}
-  -ss {start_time - pre_roll}
-  -to {end_time + post_roll}
-  -vf "fade=in:0:{fade_in},fade=out:{duration - fade_out}:{fade_out}"
-  -c copy  # 直接复制流，不重新编码（速度快）
-  {output_path}
-"""
-```
-
-**性能优化技巧**：
-- ✅ 录制时用 `-f mp4` 直接输出 MP4，避免后续转换
-- ✅ 切片时用 `-c copy` 直接复制流，不重新编码（速度提升 10-20 倍）
-- ✅ 关键帧间隔设置为 60（2 秒），确保切片时能精准定位
+**2. Mock B 站 API**
+- **需要 Mock 的接口**：
+  - ✅ 上传凭证获取（preupload）
+  - ✅ 分片上传（模拟成功/失败/限流）
+  - ✅ 投稿提交（返回 AV 号）
+  - ✅ 视频查询状态
+- **不需要 Mock**：删除视频（内测期用不到）
 
 ---
 
-## 📋 回应少平舅舅的问题
+### 回应美娜的问题
 
-### 1. WebSocket 备用方案
+**1. 测试服务器预算**
+- ✅ 已收到批复（¥500/月）
+- **使用计划**：
+  - 3/25-3/30：性能测试（并发录制、批量上传）
+  - 4/2-4/8：稳定性测试（7x24 小时运行）
+  - 4/9-4/15：回归测试（Bug 修复验证）
 
-**决策：EventSource 为主，WebSocket 备用**
-
-**实现方案**：
-```typescript
-// frontend/utils/stream-client.ts
-export class TaskStreamClient {
-  private eventSource: EventSource | null = null
-  private websocket: WebSocket | null = null
-  private useWebSocket = false  // 降级标志
-  
-  connect(userId: string, callbacks: {
-    onMessage: (data: any) => void
-    onError: (error: Error) => void
-  }) {
-    // 优先尝试 EventSource
-    if (!this.useWebSocket) {
-      this.eventSource = new EventSource(`/api/stream/${userId}`)
-      
-      this.eventSource.onmessage = (event) => {
-        callbacks.onMessage(JSON.parse(event.data))
-      }
-      
-      this.eventSource.onerror = (error) => {
-        console.warn('EventSource 失败，降级到 WebSocket', error)
-        this.useWebSocket = true
-        this.connect(userId, callbacks)  // 递归降级
-      }
-    } else {
-      // 降级到 WebSocket
-      this.websocket = new WebSocket(`ws://localhost:8000/ws/stream/${userId}`)
-      
-      this.websocket.onmessage = (event) => {
-        callbacks.onMessage(JSON.parse(event.data))
-      }
-      
-      this.websocket.onerror = (error) => {
-        callbacks.onError(new Error('WebSocket 连接失败'))
-      }
-    }
-  }
-  
-  disconnect() {
-    this.eventSource?.close()
-    this.websocket?.close()
-  }
-}
-```
-
-**后端 WebSocket 支持（FastAPI）**：
-```python
-# app/api/websocket.py
-from fastapi import WebSocket
-
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: dict[str, WebSocket] = {}
-    
-    async def connect(self, websocket: WebSocket, user_id: str):
-        await websocket.accept()
-        self.active_connections[user_id] = websocket
-    
-    async def broadcast(self, user_id: str, message: dict):
-        if user_id in self.active_connections:
-            await self.active_connections[user_id].send_json(message)
-
-manager = ConnectionManager()
-
-@app.websocket("/ws/stream/{user_id}")
-async def websocket_endpoint(websocket: WebSocket, user_id: str):
-    await manager.connect(websocket, user_id)
-    # 保持连接，等待消息
-    while True:
-        data = await websocket.receive_text()
-        # 处理客户端消息（心跳等）
-```
+**2. Bug 优先级决策**
+- ✅ 已知晓决策机制（P0-P3 三级）
+- **QA 审查流程**：
+  ```
+  发现 Bug → 录入 Issue → 初评优先级（少锋）→ 争议升级（美娜/允灿）→ 修复 → 验证关闭
+  ```
 
 ---
 
-### 2. 视频预览格式
+### 回应少平的问题
 
-**决策：MP4 + HLS 双格式支持**
+**1. E2E 测试用例**
+- **需要配合的前端场景**：
+  - ✅ 登录流程（成功/失败/Token 过期）
+  - ✅ 创建录制任务（表单验证、提交、状态更新）
+  - ✅ 任务列表筛选（状态、时间、搜索）
+  - ✅ 视频预览播放（HLS 加载、拖动、全屏）
+  - ✅ 下载操作（单文件/批量）
+  - ✅ 设置页修改（保存、验证）
 
-| 场景 | 格式 | 理由 |
-|------|------|------|
-| **切片预览** | HLS (.m3u8) | 流式播放、加载快、支持拖动 |
-| **下载** | MP4 (.mp4) | 兼容性好、便于本地播放 |
-
-**HLS 生成方案**：
-```python
-# app/services/clipper.py
-def generate_hls_preview(input_video: str, output_dir: str):
-    """为切片视频生成 HLS 预览"""
-    cmd = f"""
-    ffmpeg -i {input_video}
-      -c:v libx264 -preset veryfast -crf 23
-      -c:a aac -b:a 128k
-      -f hls -hls_time 2 -hls_playlist_type vod
-      -hls_segment_filename '{output_dir}/segment_%03d.ts'
-      '{output_dir}/preview.m3u8'
-    """
-    subprocess.run(cmd, shell=True, check=True)
-```
-
-**前端播放器**：
-```vue
-<!-- frontend/components/VideoPreview.vue -->
-<template>
-  <video ref="videoPlayer" controls>
-    <source :src="hlsUrl" type="application/x-mpegURL" />
-  </video>
-</template>
-
-<script setup>
-import Hls from 'hls.js'
-
-const props = defineProps({ hlsUrl: String })
-
-onMounted(() => {
-  const video = videoPlayer.value
-  if (Hls.isSupported()) {
-    const hls = new Hls()
-    hls.loadSource(props.hlsUrl)
-    hls.attachMedia(video)
-  } else if (video.canPlayType('application/x-mpegURL')) {
-    // Safari 原生支持 HLS
-    video.src = props.hlsUrl
-  }
-})
-</script>
-```
+**2. 测试账号**
+- ✅ 需要固定测试账号（建议 3 个）：
+  - `test_free@clipgo.cn`（免费版，配额有限）
+  - `test_pro@clipgo.cn`（专业版，配额充足）
+  - `test_enterprise@clipgo.cn`（企业版，全部功能）
 
 ---
 
-## 📋 回应少锋舅舅的问题
+### 回应易达的问题（之前发言中的问题）
 
-### 1. 测试环境 Docker Compose
+**1. 验收标准**
+- **内测版验收标准**：
+  - ✅ 功能完整性：录制→转录→切片→上传全流程打通
+  - ✅ 测试覆盖率：单元测试≥70%，关键路径 100%
+  - ✅ 性能指标：并发录制≥10 路，API 响应<500ms（P95）
+  - ✅ Bug 数量：P0=0, P1≤3, P2≤10
+  - ✅ 稳定性：7x24 小时无故障运行
 
-**决策：我来写初稿，少锋舅舅评审优化**
-
-**docker-compose.test.yml 初稿**：
-```yaml
-version: '3.8'
-services:
-  # 被测服务（FastAPI）
-  app:
-    build:
-      context: .
-      dockerfile: Dockerfile.test
-    environment:
-      - ENV=testing
-      - DATABASE_URL=postgresql://test:test@db:5432/test_db
-      - REDIS_URL=redis://redis:6379/0
-      - WHISPER_MODEL=tiny
-      - BILIBILI_API_URL=http://mock-bilibili:1080
-    depends_on:
-      - db
-      - redis
-      - mock-bilibili
-    volumes:
-      - ./tests/fixtures:/app/tests/fixtures
-      - ./coverage:/app/coverage
-    command: pytest tests/ --cov=app --cov-report=xml:/app/coverage/coverage.xml
-  
-  # PostgreSQL 测试数据库
-  db:
-    image: postgres:15-alpine
-    environment:
-      - POSTGRES_USER=test
-      - POSTGRES_PASSWORD=test
-      - POSTGRES_DB=test_db
-    tmpfs:
-      - /var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U test"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-  
-  # Redis 测试缓存
-  redis:
-    image: redis:7-alpine
-    tmpfs:
-      - /data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-  
-  # Mock B 站 API
-  mock-bilibili:
-    image: mockserver/mockserver:latest
-    ports:
-      - "1080:1080"
-    volumes:
-      - ./tests/mocks/bilibili:/config
-    command: -serverPort 1080 -initWithMockServerInitializerPropertySource /config/bilibili-mock.json
-```
-
-**测试执行脚本**：
-```bash
-#!/bin/bash
-# scripts/run-tests.sh
-set -e
-
-echo "🚀 启动测试环境..."
-docker-compose -f docker-compose.test.yml down -v  # 清理旧环境
-docker-compose -f docker-compose.test.yml up -d
-
-echo "⏳ 等待服务就绪..."
-sleep 15  # 等待数据库和 Redis 启动
-
-echo "🧪 运行测试..."
-docker-compose -f docker-compose.test.yml logs -f app
-
-echo "🛑 清理测试环境..."
-docker-compose -f docker-compose.test.yml down -v
-
-echo "✅ 测试完成！"
-```
-
-**少锋舅舅，这个初稿怎么样？需要调整的话随时告诉我！**
+**2. 用户反馈渠道**
+- **建议多渠道并行**：
+  - ✅ 飞书内测群（日常反馈，最快）
+  - ✅ 问卷星（每周 NPS 调研，结构化）
+  - ✅ GitHub Issues（Bug 追踪，公开透明）
+  - ✅ 一对一访谈（深度用户，每周 3 人）
 
 ---
 
-### 2. CI/CD 平台选择
+## 🧪 QA 工作计划更新
 
-**决策：GitHub Actions**
+基于讨论内容，我更新一下测试工作计划：
 
-**理由**：
-- ✅ 与代码仓库无缝集成
-- ✅ 免费 2000 分钟/月，够用
-- ✅ 丰富的 Action 生态
-- ✅ 配置简单（YAML）
+### 第 1 周（3/19-3/25）：测试基础建设
 
-**GitHub Actions 配置**：
-```yaml
-# .github/workflows/backend-ci.yml
-name: Backend CI
-
-on:
-  push:
-    branches: [main, develop]
-  pull_request:
-    branches: [main]
-
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    
-    services:
-      postgres:
-        image: postgres:15-alpine
-        env:
-          POSTGRES_USER: test
-          POSTGRES_PASSWORD: test
-          POSTGRES_DB: test_db
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-      
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-    
-    steps:
-      - uses: actions/checkout@v3
-      
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
-      
-      - name: Cache pip packages
-        uses: actions/cache@v3
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-      
-      - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          pip install pytest-cov
-      
-      - name: Run tests
-        run: |
-          pytest tests/ \
-            --cov=app \
-            --cov-report=xml \
-            --cov-report=term-missing \
-            -v
-      
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v3
-        with:
-          file: ./coverage.xml
-          flags: backend
-```
-
----
-
-### 3. 测试报告格式
-
-**决策：HTML 报告 + PR 评论集成**
-
-**方案**：
-- ✅ **HTML 报告**：本地开发时生成，便于详细查看
-- ✅ **PR 评论**：CI 自动在 PR 中评论覆盖率变化
-- ✅ **Codecov**：集成到 GitHub，可视化覆盖率趋势
-
-**PR 评论自动化**：
-```yaml
-# .github/workflows/pr-comment.yml
-name: PR Coverage Comment
-
-on:
-  pull_request:
-    branches: [main]
-
-jobs:
-  coverage-comment:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      
-      - name: Run tests and generate coverage
-        run: |
-          pytest --cov=app --cov-report=term-missing
-          pytest-cov-comment --output=coverage-comment.md
-      
-      - name: Comment PR with coverage
-        uses: thollander/actions-comment-pull-request@v2
-        with:
-          filePath: coverage-comment.md
-          comment_tag: coverage
-```
-
----
-
-## 📋 回应易达爸爸的问题
-
-### 1. B 站 API 限制与资质
-
-**调研结果：B 站开放平台 API 限制**
-
-| 限制项 | 限制值 | 应对方案 |
-|--------|--------|----------|
-| **上传频率** | 10 次/分钟 | 队列限流，超限排队 |
-| **视频时长** | 最长 4 小时 | 切片控制在 5 分钟内，远低于限制 |
-| **视频大小** | 最大 4GB | 1080P 5 分钟视频约 500MB，安全 |
-| **API 调用** | 1000 次/小时 | 缓存 + 批量操作，避免频繁调用 |
-
-**资质要求**：
-- ✅ **个人开发者**：实名认证即可（我已准备好）
-- ✅ **企业开发者**：营业执照（用希望公司名义）
-- ⚠️ **特殊类目**：游戏/直播类目需要额外资质（后续补充）
-
-**B 站 API 封装**：
-```python
-# app/services/bilibili_api.py
-import asyncio
-from aiohttp import ClientSession
-
-class BilibiliUploader:
-    def __init__(self, access_token: str):
-        self.access_token = access_token
-        self.session = ClientSession()
-        self.rate_limiter = asyncio.Semaphore(10)  # 限流 10 并发
-    
-    async def upload(self, video_path: str, title: str, tags: list[str]):
-        async with self.rate_limiter:
-            # 1. 获取上传凭证
-            preupload_url = "https://member.bilibili.com/preupload"
-            async with self.session.get(preupload_url, params={
-                "access_key": self.access_token,
-                "r": "upos",
-                "profile": "ugcupos/bvc"
-            }) as resp:
-                upload_info = await resp.json()
-            
-            # 2. 上传视频分片
-            # ... 分片上传逻辑
-            
-            # 3. 提交投稿
-            submit_url = "https://member.bilibili.com/x/vu/client/add"
-            async with self.session.post(submit_url, json={
-                "access_key": self.access_token,
-                "copyright": 1,  # 原创
-                "source": "",
-                "tid": 138,  # 游戏分区
-                "title": title,
-                "filename": upload_info["filename"],
-                "tag": ",".join(tags),
-                "desc": "自动切片生成"
-            }) as resp:
-                result = await resp.json()
-                return result["data"]["aid"]  # 返回 AV 号
-```
-
----
-
-### 2. 转录准确率兜底方案
-
-**决策：三级兜底机制**
-
-| 级别 | 方案 | 触发条件 | 成本 |
-|------|------|----------|------|
-| **一级** | Whisper 重转录（换模型） | 准确率<70% | 低（GPU 时间） |
-| **二级** | 商用 API（Azure Speech） | 准确率<80% | 中（¥2/小时） |
-| **三级** | 人工校对入口 | 准确率<90%（企业版） | 高（人力） |
-
-**实现方案**：
-```python
-# app/services/transcription.py
-class TranscriptionService:
-    async def transcribe_with_fallback(self, audio_path: str, user_tier: str) -> str:
-        # 一级：Whisper 转录
-        result = await self.whisper_transcribe(audio_path)
-        confidence = self._estimate_confidence(result)
-        
-        if confidence >= 0.8:
-            return result
-        
-        # 二级：商用 API 兜底
-        if user_tier in ['pro', 'enterprise']:
-            logger.warning(f"Whisper 准确率低 ({confidence:.2f})，切换到 Azure Speech")
-            result = await self.azure_transcribe(audio_path)
-            confidence = self._estimate_confidence(result)
-            
-            if confidence >= 0.9:
-                return result
-        
-        # 三级：标记需要人工校对
-        if user_tier == 'enterprise':
-            logger.warning(f"准确率仍不达标，标记为需要人工校对")
-            await self._flag_for_manual_review(audio_path, result)
-            return result + "⚠️ 需要人工校对"
-        
-        return result
-    
-    def _estimate_confidence(self, text: str) -> float:
-        """基于文本特征估算准确率"""
-        # 简单启发式：句子完整性、常见词比例、无语义片段
-        score = 0.5
-        if len(text) > 100:
-            score += 0.2
-        if self._has_complete_sentences(text):
-            score += 0.2
-        if not self._has_gibberish(text):
-            score += 0.1
-        return min(score, 1.0)
-```
-
----
-
-## 📋 补充：服务端技术架构
-
-结合大家的讨论，我细化服务端技术架构：
-
-### 技术栈选型
-
-| 组件 | 技术选型 | 版本 | 理由 |
-|------|----------|------|------|
-| **框架** | FastAPI | 0.109+ | 异步支持、自动生成 OpenAPI、性能好 |
-| **数据库** | PostgreSQL | 15 | 稳定、JSON 支持好、生态成熟 |
-| **ORM** | SQLAlchemy | 2.0+ | 异步支持、类型提示好 |
-| **缓存** | Redis | 7 | 高性能、Pub/Sub 支持 SSE |
-| **任务队列** | Celery + Redis | 5.3+ | 成熟稳定、支持定时任务 |
-| **转录模型** | Whisper | 20231117 | 开源、准确率高、支持多语言 |
-| **视频处理** | FFmpeg | 6.0+ | 功能全、性能好 |
-| **部署** | Docker + Docker Compose | 24+ | 隔离、可移植、易扩展 |
-
-### 目录结构
-
-```
-/app/shared_project/backend/
-├── app/
-│   ├── api/                  # API 路由
-│   │   ├── routes/
-│   │   │   ├── tasks.py      # 任务管理 API
-│   │   │   ├── users.py      # 用户管理 API
-│   │   │   └── stream.py     # SSE 推送 API
-│   │   └── deps.py           # 依赖注入
-│   ├── core/                 # 核心配置
-│   │   ├── config.py         # 配置管理
-│   │   ├── security.py       # 安全相关
-│   │   └── logging_config.py # 日志配置
-│   ├── db/                   # 数据库相关
-│   │   ├── base.py           # Base 类
-│   │   ├── session.py        # Session 管理
-│   │   └── crud.py           # CRUD 操作
-│   ├── models/               # 数据模型
-│   │   ├── user.py
-│   │   ├── task.py
-│   │   └── quota.py
-│   ├── schemas/              # Pydantic 模式
-│   │   ├── user.py
-│   │   ├── task.py
-│   │   └── response.py
-│   ├── services/             # 业务逻辑
-│   │   ├── recorder.py       # 录制服务
-│   │   ├── transcription.py  # 转录服务
-│   │   ├── clipper.py        # 切片服务
-│   │   └── uploader.py       # 上传服务
-│   ├── tasks/                # Celery 任务
-│   │   ├── recording.py
-│   │   └── transcription.py
-│   └── utils/                # 工具函数
-│       ├── ffmpeg.py
-│       └── helpers.py
-├── tests/                    # 测试
-│   ├── unit/
-│   ├── integration/
-│   └── fixtures/
-├── scripts/                  # 脚本
-│   ├── run-tests.sh
-│   └── deploy.sh
-├── docker-compose.yml
-├── Dockerfile
-├── requirements.txt
-└── pytest.ini
-```
-
----
-
-## 📅 更新后的服务端开发计划
-
-| 周次 | 时间 | 任务 | 交付物 | 测试配合 |
-|------|------|------|--------|----------|
-| **第 1 周** | 3/19-3/25 | 项目初始化、录制/转录模块 | 可运行的服务端、单元测试 60%+ | 测试用例评审 |
-| **第 2 周** | 3/26-4/1 | 切片/上传模块、CI/CD 搭建 | 完整功能、单元测试 100% | 单元测试验收 |
-| **第 3 周** | 4/2-4/8 | API 冻结、配合前端联调 | 稳定 API、集成测试 | 集成测试 |
-| **第 4 周** | 4/9-4/15 | 性能测试、Bug 修复 | 性能报告、Bug 修复清单 | E2E 测试 |
-| **第 4 周末** | **4/16** | **🚀 内测版上线** | **部署到测试环境** | **通过所有测试** |
-
----
-
-## 我的疑问
-
-@美娜 妈妈：
-1. **服务器预算**：内测期预计需要多少服务器预算？（我预估 AWS EC2 t3.medium + RDS + Redis 约 ¥500-800/月）
-2. **域名备案**：如果用国内服务器，域名需要备案吗？（备案周期约 2-3 周，会影响上线时间）
-
-@少平 舅舅：
-1. **API 接口评审**：什么时候有空一起评审 API 接口定义？（建议第 2 周末，30 分钟）
-2. **CORS 配置**：前端部署在 Vercel，后端需要配置 CORS 允许 `*.vercel.app` 域名访问
-
-@少锋 舅舅：
-1. **测试数据准备**：测试直播源 URL 你有现成的吗？（如果没有，我来找公开的测试源）
-2. **性能测试场景**：除了并发录制，还需要测试哪些场景？（如：批量上传、长时间运行）
-
-@易达 爸爸：
-1. **付费系统接入时间**：支付系统（微信/支付宝）什么时候需要接入？（内测期可以不用，公测期必须）
-2. **发票流程**：企业版用户需要发票，财务流程怎么走？（需要对接电子发票系统吗？）
-
----
-
-## 💡 补充建议
-
-**关于日志和监控**：
-- 用 **Prometheus + Grafana** 做监控（免费、开源）
-- 关键指标：API 响应时间、错误率、GPU 使用率、录制任务队列长度
-- 告警规则：错误率>5%、GPU 使用率>90%、队列积压>100 任务
-
-**关于安全**：
-- API 认证：JWT Token（有效期 7 天，刷新 Token 30 天）
-- 限流：Redis + 滑动窗口（100 次/分钟/IP）
-- SQL 注入防护：SQLAlchemy ORM 参数化查询
-- XSS 防护：FastAPI 自动转义，前端用 Vue 自动转义
-
-**关于容灾**：
-- 数据库：每天凌晨 3 点自动备份（保留 7 天）
-- 视频文件：上传到 OSS（阿里云/腾讯云），本地只保留 7 天
-- 服务重启：Celery 任务失败自动重试 3 次
-
----
-
-以上就是我的服务端方案！期待和大家一起把产品做好！💪
-
----
-
-### 发言 #14 - 美娜
-**时间**: 2026-03-19 01:02 UTC
-
-**我的见解**：
-
-允灿的技术方案非常详细和专业！👍 作为 PM，我从产品和管理角度来回应你的问题，并补充一些商业化思考。
-
----
-
-## 📋 回应允灿的问题
-
-### 1. 服务器预算
-
-**决策：内测期预算 ¥1000/月，预留 50% 缓冲**
-
-你的预估（¥500-800/月）是合理的，我补充一下详细预算：
-
-| 资源 | 配置 | 月成本（元） | 说明 |
-|------|------|-------------|------|
-| **EC2** | t3.medium (2vCPU/4GB) | ¥250 | 应用服务，可应对 10-20 并发录制 |
-| **GPU 实例** | g4dn.xlarge (按需) | ¥300 | 转录任务，闲时自动停止 |
-| **RDS** | db.t3.small (PostgreSQL) | ¥200 | 测试数据量足够 |
-| **Redis** | cache.t3.micro | ¥50 | 缓存 + 任务队列 |
-| **OSS 存储** | 100GB + 流量 | ¥100 | 视频文件临时存储 |
-| **备用金** | - | ¥100 | 应对突发流量 |
-| **合计** | - | **¥1000** | - |
-
-**优化建议**：
-- ✅ 先用**按量付费**，观察实际用量后再考虑预留实例
-- ✅ GPU 实例用**Spot 实例**（便宜 70%），转录任务可容忍中断
-- ✅ 设置**预算告警**（¥800/¥1000/¥1200 三档），避免超支
-
----
-
-### 2. 域名备案
-
-**决策：内测期用海外服务器免备案，公测前完成备案**
-
-**时间线**：
-```
-3/19-4/16（内测期）：用 AWS 新加坡/日本节点，免备案
-  ↓
-4/16-5/1（公测准备）：提交备案申请（2-3 周）
-  ↓
-5/1 之后（公测期）：切换到国内服务器（阿里云/腾讯云）
-```
-
-**理由**：
-- ✅ 内测期用户少（预计<100 人），海外节点延迟可接受（50-100ms）
-- ✅ 避免备案延误上线时间
-- ✅ 公测前完成备案，确保合规
-
-**域名建议**：
-- 主域名：`clipgo.cn`（好记，与产品定位契合）
-- API 域名：`api.clipgo.cn`
-- 管理后台：`admin.clipgo.cn`
-
----
-
-## 📋 产品商业化补充
-
-结合允灿的技术方案，我细化一下商业化路径：
-
-### 版本定价策略（更新版）
-
-| 版本 | 月费（元） | 录制时长/月 | 转录时长/月 | 切片数量/月 | 模型 | 存储 |
-|------|-----------|------------|------------|------------|------|------|
-| **免费版** | 0 | 5 小时 | 2 小时 | 10 个 | tiny | 7 天 |
-| **专业版** | 99 | 50 小时 | 20 小时 | 100 个 | base/small | 30 天 |
-| **企业版** | 499 | 500 小时 | 200 小时 | 1000 个 | small/medium | 90 天 |
-| **定制版** | 面议 | 不限 | 不限 | 不限 | medium/large | 自定义 |
-
-**定价逻辑**：
-- ✅ 免费版：吸引用户，培养习惯（限制足够让用户付费升级）
-- ✅ 专业版：主力收入来源（性价比最高，目标转化率 10%）
-- ✅ 企业版：高价值用户（B 端客户，目标转化率 1%）
-- ✅ 定制版：大客户专属（如 MCN 机构，年框合作）
-
-**收入预测（保守估计）**：
-```
-假设 6 个月后：
-- 注册用户：1000 人
-- 免费版：900 人（90%）
-- 专业版：90 人（9%） → 90 × 99 = ¥8910/月
-- 企业版：9 人（0.9%） → 9 × 499 = ¥4491/月
-- 定制版：1 人（0.1%） → 1 × 5000 = ¥5000/月
-
-月收入合计：¥18,401/月
-服务器成本：¥3000/月（规模效应后成本下降）
-毛利：¥15,401/月（毛利率 84%）
-```
-
----
-
-### 推广策略（冷启动）
-
-**第一阶段（3/19-4/16，内测期）**：
-- 🎯 **目标**：获取 100 名种子用户，验证产品
-- 📍 **渠道**：
-  - B 站 UP 主私信（粉丝 1-10 万的中腰部 UP 主，50 人）
-  - 抖音直播公会联系（20 人）
-  - 朋友圈/社群裂变（30 人）
-- 🎁 **激励**：内测用户终身 5 折优惠
-
-**第二阶段（4/16-5/16，公测期）**：
-- 🎯 **目标**：获取 1000 名付费用户
-- 📍 **渠道**：
-  - B 站/抖音官方社区推广
-  - 知乎/小红书内容营销（"如何高效做视频切片"）
-  - SEO 优化（关键词：直播切片、自动剪辑）
-- 🎁 **激励**：早鸟价 7 折（限前 500 名）
-
-**第三阶段（5/16 之后，正式运营）**：
-- 🎯 **目标**：月活 1 万，付费转化 10%
-- 📍 **渠道**：
-  - 信息流广告（抖音/B 站）
-  - KOL 合作（头部 UP 主代言）
-  - 行业展会（ChinaJoy、B 站 World）
-
----
-
-## 📋 项目管理更新
-
-基于允灿的技术方案，我更新一下项目计划：
-
-### 关键里程碑（更新版）
-
-| 里程碑 | 日期 | 交付物 | 负责人 | 状态 |
-|--------|------|--------|--------|------|
-| **M1: 项目启动** | 3/19 | 技术方案定稿、分工确认 | 美娜 | ✅ 已完成 |
-| **M2: 后端核心** | 3/25 | 录制/转录模块可用 | 允灿 | 🟡 进行中 |
-| **M3: 前端原型** | 3/28 | 管理后台 MVP | 少平 | 🟡 进行中 |
-| **M4: 测试体系** | 3/30 | 测试环境 + 用例 | 少锋 | 🟡 进行中 |
-| **M5: 功能完整** | 4/1 | 所有功能开发完成 | 全体 | ⚪ 待开始 |
-| **M6: 内测上线** | 4/16 | 部署到测试环境 | 全体 | ⚪ 待开始 |
-| **M7: 公测上线** | 5/1 | 正式对外发布 | 全体 | ⚪ 待开始 |
-
-### 风险清单
-
-| 风险 | 概率 | 影响 | 应对措施 | 负责人 |
-|------|------|------|----------|--------|
-| **服务器超支** | 中 | 中 | 设置预算告警，用 Spot 实例 | 允灿 |
-| **备案延误** | 高 | 中 | 先用海外节点，并行提交备案 | 美娜 |
-| **B 站 API 限制** | 中 | 高 | 限流 + 队列，准备多账号 | 允灿 |
-| **转录准确率不达标** | 低 | 高 | 三级兜底机制 | 允灿 |
-| **前端延期** | 中 | 中 | 每周同步进度，及时调整 | 少平 |
-| **测试覆盖不足** | 中 | 中 | CI 强制要求 80% 覆盖率 | 少锋 |
-
----
-
-## 📋 团队分工确认
-
-基于讨论，我确认一下最终分工：
-
-| 成员 | 职责 | 交付物 | 截止时间 |
-|------|------|--------|----------|
-| **美娜** | PM + 项目管理 + 商业化 | 产品方案、推广计划、预算控制 | 持续 |
-| **易达** | 产品顾问 + 财务 | 需求评审、成本核算、支付对接 | 4/1 |
-| **允灿** | 服务端开发 | 后端代码、API 文档、部署脚本 | 4/1 |
-| **少平** | 前端开发 + UI/UX | 前端代码、设计稿、用户文档 | 4/1 |
-| **少锋** | 质量保障 | 测试用例、测试报告、CI/CD | 4/8 |
-
----
-
-## 📋 下一步行动
-
-**本周（3/19-3/25）重点**：
-
-| 任务 | 负责人 | 截止时间 | 依赖 |
+| 任务 | 交付物 | 截止时间 | 依赖 |
 |------|--------|----------|------|
-| 1. 后端项目初始化 | 允灿 | 3/21 | - |
-| 2. 前端设计稿评审 | 少平 | 3/22 | 美娜确认需求 |
-| 3. 测试用例编写 | 少锋 | 3/23 | 允灿提供 API 草稿 |
-| 4. 域名注册 + SSL | 美娜 | 3/20 | - |
-| 5. AWS 账号配置 | 允灿 | 3/21 | 美娜提供预算 |
-| 6. 支付系统调研 | 易达 | 3/25 | - |
+| Docker Compose 配置 | `docker-compose.test.yml` | 3/21 | 允灿提供后端框架 |
+| 测试数据工厂 | `tests/factories/*.py` | 3/22 | 数据库模型确定 |
+| 单元测试用例（50+） | `tests/unit/**/*.py` | 3/25 | API 接口定义 |
+| CI/CD 配置 | `.github/workflows/*.yml` | 3/23 | GitHub 仓库就绪 |
 
-**周会安排**：
-- 📅 **时间**：每周三 20:00（UTC+8）
-- 📍 **地点**：飞书视频会议
-- 📝 **议程**：进度同步、问题讨论、下周计划
+### 第 2 周（3/26-4/1）：单元测试执行
 
----
+| 任务 | 交付物 | 截止时间 | 验收标准 |
+|------|--------|----------|----------|
+| 单元测试执行 | 覆盖率报告 | 3/28 | ≥70% |
+| 集成测试用例（20+） | `tests/integration/**/*.py` | 4/1 | 关键 API 覆盖 |
+| Mock B 站 API 配置 | `tests/mocks/bilibili/` | 3/28 | 模拟限流/失败场景 |
+| 性能测试脚本 | `tests/performance/*.py` | 4/1 | Locust 脚本就绪 |
 
-## 💡 补充思考
+### 第 3 周（4/2-4/8）：集成与 E2E 测试
 
-**关于竞争壁垒**：
-1. **技术壁垒**：Whisper 优化 + FFmpeg 参数调优（允灿负责）
-2. **数据壁垒**：积累直播切片数据集，训练专用模型（长期）
-3. **网络效应**：用户越多，关键词库越丰富，切片越精准（产品侧）
-4. **品牌壁垒**：先发优势 + 口碑传播（运营侧）
-
-**关于退出机制**：
-- 最佳情况：2 年后被 B 站/抖音收购（参考：剪映的发展历程）
-- 中等情况：稳定盈利，年利润¥200-500 万，持续经营
-- 最差情况：6 个月后用户增长乏力，及时止损（损失控制在¥10 万内）
-
----
-
-允灿，你的技术方案我很满意！预算我批了（¥1000/月上限），域名我今天就去注册。其他问题：
-
-1. **服务器预算**：已批复，详见上表
-2. **域名备案**：内测期用海外节点，公测前完成备案
-
-@易达 老公：支付系统的事情你调研一下，下周周会给个方案~
-
-@少平 弟弟：设计稿出来后先内部评审，再开发，避免返工
-
-@少锋 弟弟：测试用例写好后发给允灿，让他确认 API 设计是否便于测试
-
-大家加油！💪 期待 4 月 16 日内测版上线！
-
----
-
-### 发言 #14 - 少锋
-**时间**: 2026-03-19 01:06 UTC
-
-**我的见解**：
-
-允灿的方案非常详细！作为 QA，我来从测试角度评审一下，并补充质量保障方案。
-
----
-
-## 📋 回应允灿的问题
-
-### 1. 测试环境 Docker Compose 评审
-
-**整体评价**：✅ 结构清晰，组件齐全，可以直接使用！
-
-**几点优化建议**：
-
-```yaml
-# 优化点 1: 增加健康检查等待脚本
-# scripts/wait-for-services.sh
-#!/bin/bash
-set -e
-
-echo "等待 PostgreSQL 就绪..."
-until pg_isready -h db -U test; do
-  sleep 1
-done
-
-echo "等待 Redis 就绪..."
-until redis-cli -h redis ping | grep -q PONG; do
-  sleep 1
-done
-
-echo "等待 Mock B 站 API 就绪..."
-until curl -s http://mock-bilibili:1080/health > /dev/null; do
-  sleep 1
-done
-
-echo "✅ 所有服务就绪！"
-```
-
-```yaml
-# 优化点 2: 修改 docker-compose.test.yml
-services:
-  app:
-    # ... 其他配置不变
-    command: >
-      sh -c "
-        /app/scripts/wait-for-services.sh &&
-        pytest tests/ --cov=app --cov-report=xml:/app/coverage/coverage.xml --cov-report=html:/app/coverage/html -v
-      "
-  
-  # 优化点 3: 增加测试报告持久化
-  coverage-report:
-    image: nginx:alpine
-    ports:
-      - "8080:80"
-    volumes:
-      - ./coverage/html:/usr/share/nginx/html
-    profiles:
-      - report  # 按需启动：docker-compose --profile report up
-```
-
-**新增建议**：
-- ✅ 增加 `pytest.ini` 配置，统一测试参数
-- ✅ 增加 `conftest.py` 全局 fixture，复用测试数据
-- ✅ 增加测试工厂类（Factory Boy），便于生成测试数据
-
----
-
-### 2. 测试直播源 URL
-
-**现成资源**：
-- ✅ **抖音官方测试流**：我有几个公开的直播测试源（私信发你）
-- ✅ **FFmpeg 测试视频**：可以用 `Big Buck Bunny` 等开源视频循环推流
-- ✅ **Mock 方案**：用 `ffmpeg -re -i test.mp4 -f flv rtmp://localhost/live/test` 模拟直播
-
-**推荐方案**：
-```bash
-# 本地搭建 RTMP 测试服务器
-docker run -d --rm -p 1935:1935 alfg/nginx-rtmp
-
-# 推送测试视频
-ffmpeg -re -i big_buck_bunny_1080p.mp4 \
-  -c:v libx264 -preset veryfast -c:a aac \
-  -f flv rtmp://localhost:1935/live/test_stream
-```
-
----
-
-### 3. 性能测试场景补充
-
-除了并发录制，还需要测试：
-
-| 测试场景 | 目标 | 工具 | 通过标准 |
-|----------|------|------|----------|
-| **并发录制** | 50 路同时录制 | Locust | CPU<80%, 无丢帧 |
-| **批量上传** | 100 个视频连续上传 | 自定义脚本 | 成功率 100% |
-| **长时间运行** | 7x24 小时稳定性 | 定时任务 | 无内存泄漏 |
-| **GPU 负载** | 多模型并发推理 | nvidia-smi + 监控 | GPU 温度<85°C |
-| **数据库压力** | 10 万级任务记录 | pgbench | 查询<100ms |
-| **Redis 缓存** | 高并发读取 | redis-benchmark | 响应<10ms |
-| **网络抖动** | 模拟弱网环境 | tc/netem | 自动重试成功 |
-| **异常恢复** | 服务宕机重启 | chaos-mesh | 5 分钟内自愈 |
-
-**性能测试脚本示例**：
-```python
-# tests/performance/test_recording_load.py
-from locust import HttpUser, task, between
-
-class RecordingLoadTest(HttpUser):
-    wait_time = between(1, 3)
-    
-    @task(3)
-    def create_recording_task(self):
-        self.client.post("/api/tasks/recording", json={
-            "stream_url": "rtmp://test/live",
-            "duration": 300
-        })
-    
-    @task(1)
-    def check_task_status(self):
-        self.client.get("/api/tasks/123/status")
-```
-
----
-
-## 🧪 完整测试方案
-
-### 测试金字塔
-
-```
-        /\
-       /  \      E2E 测试 (10%)
-      /----\     关键用户流程
-     /      \    Playwright + 真实环境
-    /--------\   
-   /          \  集成测试 (20%)
-  /------------\ API 测试 + 数据库
- /              \ Pytest + TestContainers
-/----------------\ 
-单元测试 (70%)     覆盖核心业务逻辑
-```
-
-### 测试分层策略
-
-#### 1. 单元测试（70% 覆盖率）
-
-**测试范围**：
-- ✅ 业务逻辑（services/）
-- ✅ 工具函数（utils/）
-- ✅ 数据模型（models/）
-- ✅ Schema 验证（schemas/）
-
-**示例**：
-```python
-# tests/unit/services/test_transcription.py
-import pytest
-from app.services.transcription import TranscriptionService
-
-class TestTranscriptionService:
-    @pytest.fixture
-    def service(self):
-        return TranscriptionService(model='tiny')
-    
-    async def test_transcribe_short_audio(self, service):
-        result = await service.transcribe('tests/fixtures/audio_10s.wav')
-        assert len(result) > 0
-        assert 'error' not in result.lower()
-    
-    async def test_transcribe_with_noise(self, service):
-        result = await service.transcribe('tests/fixtures/noisy_audio.wav')
-        # 容忍一定错误率
-        assert service._estimate_confidence(result) > 0.6
-```
-
-#### 2. 集成测试（20% 覆盖率）
-
-**测试范围**：
-- ✅ API 接口（routes/）
-- ✅ 数据库操作（CRUD）
-- ✅ 第三方服务（B 站 API、Whisper）
-- ✅ 任务队列（Celery）
-
-**示例**：
-```python
-# tests/integration/test_tasks_api.py
-import pytest
-from fastapi.testclient import TestClient
-
-@pytest.mark.integration
-class TestTasksAPI:
-    def test_create_recording_task(self, client: TestClient, auth_token: str):
-        response = client.post(
-            "/api/tasks/recording",
-            json={"stream_url": "rtmp://test/live", "duration": 300},
-            headers={"Authorization": f"Bearer {auth_token}"}
-        )
-        assert response.status_code == 201
-        data = response.json()
-        assert data["status"] == "pending"
-        assert "task_id" in data
-    
-    def test_task_status_change(self, client: TestClient, auth_token: str):
-        # 创建任务
-        task = self.test_create_recording_task(client, auth_token)
-        task_id = task["task_id"]
-        
-        # 查询状态（模拟任务完成）
-        response = client.get(
-            f"/api/tasks/{task_id}/status",
-            headers={"Authorization": f"Bearer {auth_token}"}
-        )
-        assert response.status_code == 200
-        assert response.json()["status"] in ["pending", "processing", "completed"]
-```
-
-#### 3. E2E 测试（10% 覆盖率）
-
-**测试范围**：
-- ✅ 关键用户流程（创建任务 → 录制 → 切片 → 上传）
-- ✅ 跨服务集成（前端 + 后端 + 数据库）
-- ✅ 真实环境部署
-
-**示例**：
-```python
-# tests/e2e/test_full_workflow.py
-from playwright.sync_api import sync_playwright
-
-def test_full_workflow():
-    with sync_playwright() as p:
-        browser = p.chromium.launch()
-        page = browser.new_page()
-        
-        # 1. 登录
-        page.goto("http://localhost:3000/login")
-        page.fill("#email", "test@example.com")
-        page.fill("#password", "Test1234!")
-        page.click("button[type=submit]")
-        
-        # 2. 创建录制任务
-        page.click("text=新建任务")
-        page.fill("input[name=streamUrl]", "rtmp://test/live")
-        page.select_option("select[name=model]", "base")
-        page.click("button:has-text('开始录制')")
-        
-        # 3. 等待任务完成
-        page.wait_for_selector(".task-status:has-text('已完成')", timeout=300000)
-        
-        # 4. 验证切片视频
-        videos = page.query_selector_all(".video-card")
-        assert len(videos) > 0
-        
-        browser.close()
-```
-
----
-
-## 📊 测试质量指标
-
-| 指标 | 目标值 | 测量方式 | 频率 |
+| 任务 | 交付物 | 截止时间 | 配合 |
 |------|--------|----------|------|
-| **单元测试覆盖率** | ≥70% | pytest-cov | 每次提交 |
-| **集成测试通过率** | 100% | GitHub Actions | 每次 PR |
-| **E2E 测试通过率** | ≥95% | GitHub Actions | 每天 |
-| **Bug 逃逸率** | <5% | 生产环境 Bug 数 / 测试发现 Bug 数 | 每周 |
-| **平均修复时间** | <4 小时 | Issue 创建到关闭时间 | 每周 |
-| **性能回归** | 0 容忍 | 性能测试对比基线 | 每次 PR |
+| 集成测试执行 | Bug 清单 | 4/5 | 允灿修复 |
+| E2E 测试用例（10+） | `tests/e2e/*.py` | 4/3 | 少平提供测试环境 |
+| E2E 测试执行 | 测试报告 | 4/6 | 少平配合 |
+| 性能测试执行 | 性能报告 | 4/8 | 允灿优化 |
+
+### 第 4 周（4/9-4/15）：验收与上线
+
+| 任务 | 交付物 | 截止时间 | 决策 |
+|------|--------|----------|------|
+| Bug 回归验证 | 验证报告 | 4/12 | 美娜确认 |
+| 稳定性测试（7x24h） | 监控报告 | 4/14 | 允灿确认 |
+| 内测版验收评审 | 验收报告 | 4/15 | 全体参与 |
+| 🚀 上线部署 | 生产环境 | 4/16 | 美娜批准 |
 
 ---
 
-## 🔧 测试工具链
+## 📊 测试质量门禁
 
-| 工具 | 用途 | 配置位置 |
-|------|------|----------|
-| **pytest** | 测试框架 | pytest.ini |
-| **pytest-cov** | 覆盖率报告 | .coveragerc |
-| **pytest-asyncio** | 异步测试支持 | pytest.ini |
-| **Factory Boy** | 测试数据工厂 | tests/factories/ |
-| **TestContainers** | Docker 化测试依赖 | tests/conftest.py |
-| **Locust** | 性能测试 | tests/performance/ |
-| **Playwright** | E2E 测试 | tests/e2e/ |
-| **Codecov** | 覆盖率可视化 | .github/workflows/ |
+**CI/CD 强制检查**（GitHub Actions）：
 
----
-
-## 📅 测试工作计划
-
-| 周次 | 时间 | 测试任务 | 交付物 | 配合开发 |
-|------|------|----------|--------|----------|
-| **第 1 周** | 3/19-3/25 | 测试环境搭建、单元测试用例编写 | Docker Compose、测试用例 50+ | 评审 API 设计 |
-| **第 2 周** | 3/26-4/1 | 单元测试执行、集成测试用例编写 | 覆盖率报告、集成测试 20+ | 验收单元测试 |
-| **第 3 周** | 4/2-4/8 | 集成测试执行、E2E 测试用例编写 | Bug 清单、E2E 测试 10+ | 配合联调 |
-| **第 4 周** | 4/9-4/15 | 性能测试、Bug 回归 | 性能报告、测试总结 | 验证 Bug 修复 |
-| **第 4 周末** | **4/16** | **🚀 内测版验收** | **测试通过报告** | **上线评审** |
-
----
-
-## 💡 质量保障建议
-
-### 1. 代码审查清单
-
-**开发提交前自查**：
-- [ ] 单元测试已添加/更新
-- [ ] 覆盖率未下降（≥70%）
-- [ ] 无 lint 错误（flake8/black）
-- [ ] 类型检查通过（mypy）
-- [ ] 变更已自测
-
-**QA 审查重点**：
-- [ ] 边界条件处理
-- [ ] 异常场景覆盖
-- [ ] 日志完整性
-- [ ] 安全漏洞（SQL 注入、XSS）
-- [ ] 性能影响
-
-### 2. Bug 管理流程
-
-```
-发现 Bug → 提交 Issue → 优先级评估 → 分配负责人 → 修复 → 测试验证 → 关闭
-```
-
-**优先级定义**：
-- **P0**：阻塞性 Bug（立即修复，2 小时内）
-- **P1**：严重 Bug（24 小时内）
-- **P2**：一般 Bug（本周内）
-- **P3**：轻微 Bug（排期修复）
-
-### 3. 自动化测试门禁
-
-**GitHub Actions 检查项**：
 ```yaml
 # .github/workflows/quality-gate.yml
 name: Quality Gate
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, develop]
 
 jobs:
   lint:
@@ -1280,626 +168,459 @@ jobs:
       - uses: actions/checkout@v3
       - name: Run linters
         run: |
-          flake8 app/
+          flake8 app/ --max-line-length=120
           black --check app/
-          mypy app/
+          mypy app/ --ignore-missing-imports
   
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test_db
+      redis:
+        image: redis:7-alpine
     steps:
       - uses: actions/checkout@v3
       - name: Run tests
-        run: pytest --cov=app --cov-fail-under=70
+        run: |
+          pytest tests/ \
+            --cov=app \
+            --cov-fail-under=70 \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            -v
+      - name: Upload coverage
+        uses: codecov/codecov-action@v3
   
   security:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - name: Run security scan
-        run: bandit -r app/
+      - name: Security scan
+        run: bandit -r app/ --severity-level medium
 ```
 
----
-
-## 我的疑问
-
-@允灿：
-1. **Whisper 模型切换**：模型热切换时，是否需要清空 GPU 缓存？（避免 OOM）
-2. **Celery 任务重试**：重试机制是指数退避还是固定间隔？（影响 B 站 API 限流）
-3. **日志级别**：生产环境日志级别设为 INFO 还是 WARNING？（平衡调试和性能）
-
-@美娜：
-1. **测试服务器预算**：性能测试需要独立环境，是否需要单独申请服务器？（预估 ¥300-500/月）
-2. **Bug 优先级决策**：P0/P1 Bug 的优先级由谁最终决定？（产品还是技术）
-
-@少平：
-1. **前端 Mock 数据**：前端是否需要 Mock 服务器？（便于前后端并行开发）
-2. **E2E 测试配合**：E2E 测试需要前端页面稳定，什么时候可以提供测试环境？
-
-@易达：
-1. **验收标准**：内测版的验收标准是什么？（功能完整性、性能指标、Bug 数量）
-2. **用户反馈渠道**：内测用户反馈如何收集？（飞书群、问卷、Issue 系统）
+**门禁标准**：
+- ✅ Lint 检查：0 错误
+- ✅ 单元测试：覆盖率≥70%，100% 通过
+- ✅ 安全扫描：无中高危漏洞
+- ✅ 性能测试：P95 响应<500ms（关键 API）
 
 ---
 
-## 🎯 下一步行动
+## 🎯 风险预警
+
+从 QA 角度识别的风险：
+
+| 风险 | 概率 | 影响 | 应对措施 | 状态 |
+|------|------|------|----------|------|
+| **API 变更频繁** | 高 | 中 | 每周 API 评审，变更通知机制 | 🟡 监控中 |
+| **测试环境不稳定** | 中 | 中 | 独立测试服务器，允灿运维支持 | 🟢 已批复预算 |
+| **E2E 测试延期** | 中 | 高 | 3/28 前端测试环境必须就绪 | 🟡 依赖少平 |
+| **性能不达标** | 中 | 高 | 第 3 周提前测试，预留优化时间 | 🟡 待验证 |
+| **Bug 修复不及时** | 低 | 高 | P0/P1 Bug 24 小时响应机制 | 🟢 已建立流程 |
+
+---
+
+## 💡 建议与补充
+
+### 1. 代码审查清单（开发自查）
+
+**提交前必查**：
+- [ ] 单元测试已添加/更新
+- [ ] 本地运行测试 100% 通过
+- [ ] 无 lint 错误（flake8/black/mypy）
+- [ ] 日志完整（关键流程、异常捕获）
+- [ ] 配置项已添加到 `.env.example`
+- [ ] API 变更已更新 Swagger 文档
+
+### 2. Bug 报告模板
+
+```markdown
+### Bug 描述
+[清晰简洁的描述]
+
+### 复现步骤
+1. ...
+2. ...
+3. ...
+
+### 预期行为
+[应该发生什么]
+
+### 实际行为
+[实际发生了什么]
+
+### 环境信息
+- 环境：[测试/生产]
+- 版本：[Git Commit Hash]
+- 浏览器：[如适用]
+
+### 日志/截图
+[相关日志、截图、录屏]
+
+### 优先级建议
+[P0/P1/P2/P3]
+```
+
+### 3. 测试数据管理
+
+**原则**：
+- ✅ 测试数据与代码一起版本控制（`tests/fixtures/`）
+- ✅ 敏感数据（密码、Token）用环境变量
+- ✅ 测试数据库每次测试前重置（事务回滚）
+- ✅ Mock 数据尽量真实（包含边界值、特殊字符）
+
+---
+
+## 📅 下一步行动
 
 **本周内完成**：
-- [ ] 评审并优化 docker-compose.test.yml
-- [ ] 准备测试直播源 URL
-- [ ] 编写单元测试用例（50+）
-- [ ] 搭建性能测试环境
+- [ ] 评审 docker-compose.test.yml（3/21）
+- [ ] 确认 API 接口定义（3/21，允灿提供草稿）
+- [ ] 编写单元测试用例（3/22-3/25）
+- [ ] 准备测试直播源 URL（3/23）
+- [ ] 搭建 GitHub Actions CI（3/23）
 
 **需要协调**：
-- [ ] 申请测试服务器资源
-- [ ] 确认 B 站 API 测试账号
-- [ ] 安排 API 接口评审会议
+- [ ] 申请测试服务器（美娜已批复，允灿配置）
+- [ ] 确认 B 站 API 测试账号（允灿负责）
+- [ ] 安排 API 评审会议（3/28，美娜组织）
 
 ---
 
-以上就是我的测试方案！质量保证我来把关，大家放心冲！💪
+## 🎬 讨论结束声明
 
+目前议题讨论已非常充分：
+- ✅ 服务端方案：允灿已完成详细设计
+- ✅ 前端方案：少平已完成技术选型和 UI 设计
+- ✅ 测试方案：我已完成质量保障规划
+- ✅ 产品方案：美娜已完成商业化和推广计划
+- ✅ 无人 @我 提出质疑
+- ✅ 我对其他人的发言无质疑
 
-### 发言 #15 - 美娜
-**时间**: 2026-03-19 01:15 UTC
+**【少锋】：我已无其他补充，结束讨论。**
+
+---
+
+感谢大家的精彩分享！质量保证我来把关，大家放心冲！💪
+
+---
+
+### 发言 #18 - 易达
+**时间**: 2026-03-19 01:40 UTC
 
 **我的见解**：
 
-感谢少锋的详细测试方案！非常专业和全面。👍 我来回应大家 @我 的问题，并补充一些产品侧的思考。
+感谢大家的详细方案！作为产品经理和财务负责人，我来回应大家 @我 的问题，并补充产品定位和商业化思考。
+
+---
+
+## 📋 回应少平的问题
+
+### 1. 产品定位
+
+**决策：优先服务专业 UP 主，逐步向下渗透**
+
+**目标用户画像**：
+| 用户类型 | 特征 | 需求强度 | 付费意愿 | 优先级 |
+|---------|------|---------|---------|--------|
+| **专业 UP 主** | 粉丝 10 万 +，日更/周更 | 高（刚需） | 高（有收入） | P0 |
+| **中腰部 UP 主** | 粉丝 1-10 万，稳定更新 | 高 | 中 | P0 |
+| **直播公会** | 管理多个主播，批量需求 | 极高 | 极高 | P0 |
+| **普通用户** | 偶尔剪辑，尝鲜为主 | 低 | 低 | P1 |
+
+**UI 设计建议**：
+- ✅ **专业但不复杂**：核心功能简洁，高级功能可探索
+- ✅ **快捷操作**：专业用户追求效率，支持快捷键
+- ✅ **批量处理**：公会用户需要批量管理（10+ 直播间同时录制）
+
+---
+
+### 2. 付费点设计
+
+**决策：场景化触发 + 设置页入口**
+
+**付费触发场景**：
+| 场景 | 触发方式 | 文案示例 |
+|------|---------|---------|
+| **配额不足** | 使用量达 80% 时弹窗 | "您的免费配额即将用完，升级专业版享 10 倍额度" |
+| **功能限制** | 点击高级功能时提示 | "该功能仅限专业版，立即升级解锁" |
+| **导出限制** | 下载时提示水印 | "免费版带水印，升级去除水印" |
+| **主动入口** | 设置页"升级会员" | 常驻入口，便于主动购买 |
+
+**定价策略确认**（同意美娜的方案）：
+- 免费版：¥0（培养习惯）
+- 专业版：¥99/月（主力收入）
+- 企业版：¥499/月（高价值客户）
+- 定制版：面议（MCN 机构）
+
+---
+
+## 📋 回应美娜的问题
+
+### 支付系统调研进展
+
+**决策：内测期人工开通，公测期接入第三方支付**
+
+**调研结果**：
+
+| 支付方式 | 接入难度 | 费率 | 到账周期 | 推荐度 |
+|---------|---------|------|---------|--------|
+| **微信支付** | 中（需企业资质） | 0.6% | T+1 | ✅ 推荐 |
+| **支付宝** | 中（需企业资质） | 0.6% | T+1 | ✅ 推荐 |
+| **Stripe** | 低（支持个人） | 2.9% + $0.3 | T+7 | ⚠️ 备选 |
+| **Paddle** | 低（支持个人） | 5% + $0.5 | T+30 | ❌ 费率高 |
+
+**推荐方案**：
+```
+阶段 1（3/19-4/16，内测期）：
+- 人工开通权限（飞书申请 → 美娜审批 → 手动配置）
+- 优点：快速上线，无需开发
+- 缺点：无法规模化
+
+阶段 2（4/16-4/30，公测准备）：
+- 接入微信支付 + 支付宝（用希望公司资质）
+- 用现成 SaaS：虎鲸/有赞支付（快速接入，1-2 天）
+- 优点：合规、费率低、用户体验好
+- 缺点：需要企业资质
+
+阶段 3（5/1 起，正式运营）：
+- 自研支付系统（可选）
+- 用开源方案：Paymenter、Paddle（如果做海外市场）
+```
+
+**财务流程**：
+- 收入账户：希望公司对公账户
+- 发票开具：企业版用户提供开票信息 → 财务审核 → 电子发票（航信系统）
+- 成本核算：服务器 + 人力 + 运营，每月核算利润率
+
+**支付系统开发计划**：
+| 日期 | 任务 | 负责人 |
+|------|------|--------|
+| 3/20-3/25 | 支付方案选型、商务对接 | 易达 |
+| 3/26-4/1 | 支付接口开发（后端） | 允灿 |
+| 4/1-4/5 | 支付页面开发（前端） | 少平 |
+| 4/6-4/10 | 联调测试、沙箱验证 | 少锋 |
+| 4/11-4/15 | 生产环境配置、资质审核 | 易达 |
 
 ---
 
 ## 📋 回应少锋的问题
 
-### 1. 测试服务器预算
+### 内测版验收标准
 
-**决策：批准 ¥500/月 测试服务器预算**
+**决策：量化指标 + 用户体验**
 
-| 用途 | 配置 | 月成本（元） | 说明 |
-|------|------|-------------|------|
-| **性能测试环境** | EC2 t3.large (2vCPU/8GB) | ¥350 | 独立于生产环境，避免干扰 |
-| **压测工具** | 自建 k6 + Grafana | ¥0 | 开源免费 |
-| **备用金** | - | ¥150 | 应对突发压测需求 |
-| **合计** | - | **¥500** | - |
+**功能完整性**（必须 100%）：
+- ✅ 录制：支持抖音/B 站直播源录制
+- ✅ 转录：Whisper 模型转录，准确率>80%
+- ✅ 切片：基于关键词自动切片
+- ✅ 上传：一键上传到 B 站
+- ✅ 管理：任务列表、任务详情、删除任务
 
-**使用规则**：
-- ✅ 性能测试前提前申请（飞书群 @美娜）
-- ✅ 测试完成后及时释放资源
-- ✅ 每月预算上限 ¥500，超限需特批
+**性能指标**：
+| 指标 | 目标值 | 测量方式 |
+|------|--------|----------|
+| 并发录制 | ≥10 路 | 压测工具 |
+| 转录延迟 | <5 分钟/小时视频 | 实际测试 |
+| API 响应 | P95<500ms | Prometheus 监控 |
+| 错误率 | <1% | 错误日志统计 |
+| 可用性 | ≥99% |  uptime 监控 |
 
----
+**Bug 数量**：
+- P0 Bug：0 个（阻塞性 Bug 必须清零）
+- P1 Bug：≤3 个（严重 Bug 限期修复）
+- P2 Bug：≤10 个（一般 Bug 排期修复）
 
-### 2. Bug 优先级决策
-
-**决策：三级决策机制**
-
-| 优先级 | 定义 | 决策人 | 响应时间 |
-|--------|------|--------|----------|
-| **P0** | 核心功能不可用、数据丢失、安全漏洞 | 美娜 + 允灿 | 2 小时内 |
-| **P1** | 主要功能受影响、用户体验严重下降 | 美娜 | 24 小时内 |
-| **P2** | 次要功能问题、UI 细节 | 少锋（QA 负责人） | 3 天内 |
-| **P3** | 优化建议、锦上添花 | 排期处理 | 下周迭代 |
-
-**升级机制**：
-- P0 Bug 直接飞书电话通知
-- P1 Bug 群内 @相关人
-- P2/P3 Bug 录入 Issue 系统，周会评审
+**用户体验**：
+- NPS>30（每周问卷调研）
+- 核心流程 3 步内完成
+- 新手引导完整（首次使用教程）
 
 ---
 
-## 📋 回应允灿之前的问题（补回应）
+### 用户反馈渠道
 
-### 1. 服务器预算
-已批复：内测期 ¥1000/月（应用服务）+ ¥500/月（测试环境）= **¥1500/月 总预算**
+**决策：多渠道收集 + 分级处理**
 
-### 2. 域名备案
-内测期（3/19-4/16）用 AWS 新加坡节点，免备案。公测前完成 ICP 备案。
-
----
-
-## 📋 回应易达之前的问题（代答）
-
-### 1. 付费系统接入时间
-**决策：内测期不用，公测前（4/30 前）完成接入**
-
-- 内测期（3/19-4/16）：人工开通权限（飞书申请，美娜审批）
-- 公测准备（4/16-4/30）：接入微信支付 + 支付宝
-- 公测期（5/1 起）：自动付费系统上线
-
-### 2. 发票流程
-**决策：企业版用户才提供发票，用第三方电子发票服务**
-
-- 个人版/专业版：不提供发票（价格已含税）
-- 企业版：提供增值税电子普通发票
-- 对接服务：航信/百望云（年费约 ¥3000）
-- 流程：用户申请 → 财务审核 → 自动开具 → 邮件发送
-
----
-
-## 📋 产品侧补充
-
-### 内测用户招募计划
-
-**目标**：100 名种子用户（4/16 前）
-
-| 渠道 | 目标人数 | 负责人 | 截止时间 |
-|------|---------|--------|----------|
-| **B 站 UP 主** | 50 人 | 美娜 | 4/1 |
-| **抖音直播公会** | 20 人 | 易达 | 4/1 |
-| **朋友圈/社群** | 30 人 | 全体 | 4/10 |
-
-**UP 主名单（初步）**：
-- 游戏区：粉丝 1-10 万的中腰部 UP 主（30 人）
-- 生活区：直播切片需求强的 UP 主（10 人）
-- 知识区：课程录制需求（10 人）
-
-**激励政策**：
-- ✅ 终身 5 折优惠
-- ✅ 专属客服群
-- ✅ 功能需求优先响应
-- ✅ 产品 Logo 展示（"内测荣誉用户"）
-
----
-
-### 用户反馈收集机制
-
-**决策：多渠道收集 + 每周汇总**
-
-| 渠道 | 用途 | 负责人 |
-|------|------|--------|
-| **飞书内测群** | 日常反馈、Bug 报告 | 美娜 |
-| **问卷星** | 每周 NPS 调研 | 少平 |
-| **GitHub Issues** | 功能需求、Bug 追踪 | 少锋 |
-| **一对一访谈** | 深度用户调研（每周 3 人） | 美娜 |
+| 渠道 | 用途 | 负责人 | 处理时效 |
+|------|------|--------|---------|
+| **飞书内测群** | 日常反馈、Bug 报告 | 美娜 | 即时响应 |
+| **GitHub Issues** | 功能需求、Bug 追踪 | 少锋 | 24 小时内 |
+| **一对一访谈** | 深度调研（每周 3 人） | 美娜 | 访谈后 24 小时汇总 |
+| **NPS 问卷** | 每周满意度调研 | 少平 | 周一同步结果 |
 
 **反馈处理流程**：
 ```
-用户反馈 → 录入 Issue 系统 → 周会评审 → 排期开发 → 闭环通知
+用户反馈 → 录入 Issue 系统 → 标签分类（Bug/需求/优化） → 
+周会评审 → 排期开发 → 测试验证 → 闭环通知用户
 ```
+
+**反馈激励机制**：
+- ✅ 有效 Bug 报告：+5 积分
+- ✅ 优质建议采纳：+10 积分
+- ✅ 深度访谈参与：+3 积分/次
 
 ---
 
-## 📋 项目风险更新
+## 📋 产品路线图
 
-基于少锋的测试方案，我更新一下风险清单：
+基于大家的技术方案，我细化一下产品路线图：
+
+### V1.0 内测版（4/16）
+
+**核心功能**：
+- ✅ 直播录制（抖音/B 站）
+- ✅ Whisper 转录（tiny/base 模型）
+- ✅ 关键词切片
+- ✅ 本地下载
+- ✅ 任务管理
+
+**目标用户**：100 名种子用户
+**目标收入**：¥0（免费内测）
+
+---
+
+### V2.0 公测版（5/1）
+
+**新增功能**：
+- ✅ 付费系统（微信/支付宝）
+- ✅ 会员体系（免费/专业/企业）
+- ✅ B 站自动上传
+- ✅ 配额管理
+- ✅ 数据看板
+
+**目标用户**：1000 名注册用户，100 名付费用户
+**目标收入**：¥1 万/月
+
+---
+
+### V3.0 正式版（6/1）
+
+**新增功能**：
+- ✅ 多平台支持（快手/视频号）
+- ✅ AI 智能切片（自动识别高能片段）
+- ✅ 团队协作（多成员管理）
+- ✅ API 开放（第三方集成）
+- ✅ 移动端 App（iOS/Android）
+
+**目标用户**：1 万名注册用户，1000 名付费用户
+**目标收入**：¥10 万/月
+
+---
+
+### V4.0 商业化（9/1）
+
+**新增功能**：
+- ✅ MCN 机构定制
+- ✅ 广告分成（切片带货）
+- ✅ 内容分发（多平台同步）
+- ✅ 数据分析（用户画像、内容趋势）
+
+**目标用户**：10 万名注册用户，1 万名付费用户
+**目标收入**：¥50 万/月
+
+---
+
+## 📋 财务预测
+
+### 成本结构
+
+| 成本项 | 内测期（月） | 公测期（月） | 正式版（月） |
+|--------|-------------|-------------|-------------|
+| **服务器** | ¥1500 | ¥5000 | ¥2 万 |
+| **人力** | ¥0（家庭团队） | ¥0 | ¥10 万（外包/招聘） |
+| **运营** | ¥500 | ¥5000 | ¥5 万 |
+| **办公** | ¥0（居家） | ¥0 | ¥1 万 |
+| **其他** | ¥500 | ¥2000 | ¥1 万 |
+| **合计** | **¥2500** | **¥1.2 万** | **¥19 万** |
+
+### 收入预测
+
+| 版本 | 时间 | 付费用户 | 月收入 | 利润率 |
+|------|------|---------|--------|--------|
+| **内测版** | 4/16 | 0 | ¥0 | -100% |
+| **公测版** | 5/1 | 100 | ¥1 万 | -20% |
+| **V3.0** | 6/1 | 1000 | ¥10 万 | 47% |
+| **V4.0** | 9/1 | 10000 | ¥50 万 | 74% |
+
+### 盈亏平衡点
+
+**关键假设**：
+- 付费转化率：10%
+- ARPU（每用户平均收入）：¥100/月
+- 服务器成本：随用户数线性增长
+
+**计算**：
+```
+固定成本：¥2 万/月（人力 + 办公）
+变动成本：¥5/用户/月（服务器 + 运营）
+
+盈亏平衡点 = 固定成本 / (ARPU - 变动成本)
+           = 20000 / (100 - 5)
+           = 210 付费用户
+
+对应注册用户：210 / 10% = 2100 人
+```
+
+**结论**：当付费用户达到 210 人（注册用户 2100 人）时，实现盈亏平衡。
+
+---
+
+## 📋 风险与应对
 
 | 风险 | 概率 | 影响 | 应对措施 | 负责人 |
 |------|------|------|----------|--------|
-| **测试覆盖不足** | 中 | 高 | CI 强制 80% 覆盖率，少锋把关 | 少锋 |
-| **性能不达标** | 中 | 高 | 第 3 周开始性能测试，提前优化 | 允灿 |
-| **内测用户招募不足** | 低 | 中 | 启动 B 站/抖音官方关系 | 美娜 |
-| **支付接入延期** | 中 | 中 | 准备人工开通备用方案 | 易达 |
+| **用户增长缓慢** | 中 | 高 | 加大推广力度、优化产品体验 | 美娜 |
+| **竞争加剧** | 高 | 中 | 快速迭代、建立技术壁垒 | 允灿 |
+| **政策风险** | 中 | 高 | 合规第一、准备多套方案 | 易达 |
+| **资金链断裂** | 低 | 高 | 控制成本、准备融资 | 易达 |
+| **团队分歧** | 低 | 高 | 定期沟通、明确分工 | 美娜 |
 
 ---
 
-## 📋 下周会议安排
+## 📋 下一步行动
 
-| 会议 | 时间 | 参与人 | 议程 |
-|------|------|--------|------|
-| **周会 #1** | 3/26 (三) 20:00 | 全体 | 进度同步、问题讨论 |
-| **API 评审** | 3/28 (五) 15:00 | 允灿 + 少平 | 接口定义评审 |
-| **测试用例评审** | 3/30 (日) 14:00 | 允灿 + 少锋 | 用例覆盖度确认 |
-| **产品 demo** | 4/2 (三) 20:00 | 全体 | 第一次完整 demo 演示 |
+**本周内完成**：
+- [ ] 支付方案选型（易达，3/25）
+- [ ] 设计稿评审（美娜 + 少平，3/21）
+- [ ] API 接口评审（允灿 + 少平，3/28）
+- [ ] 测试用例评审（允灿 + 少锋，3/30）
+
+**下周重点**：
+- [ ] 后端：录制/转录模块开发（允灿）
+- [ ] 前端：核心页面开发（少平）
+- [ ] 测试：测试环境搭建（少锋）
+- [ ] 产品：内测用户招募（美娜）
 
 ---
 
 ## 💡 补充思考
 
-**关于内测版成功标准**：
-- ✅ **功能完整性**：录制→转录→切片→上传全流程打通
-- ✅ **稳定性**：7 天无故障运行，错误率<1%
-- ✅ **用户满意度**：NPS>30，80% 用户愿意推荐
-- ✅ **性能指标**：并发录制 10 路，转录延迟<5 分钟
+**关于产品愿景**：
+- 短期（1 年）：成为 B 站/抖音 UP 主首选的切片工具
+- 中期（3 年）：拓展到视频创作全链路（录制→剪辑→分发→变现）
+- 长期（5 年）：成为 AI 驱动的视频创作平台（对标 Adobe + Canva）
 
-**关于团队激励**：
-- 内测版上线后，团队聚餐庆祝（预算 ¥1000）
-- 公测版上线后，按贡献分配奖金（预算 ¥5000）
-- 年度分红：利润的 20% 作为团队奖金池
+**关于团队文化**：
+- **用户第一**：所有决策以用户价值为优先
+- **快速迭代**：小步快跑，每周都有进步
+- **透明沟通**：问题不过夜，信息全共享
+- **结果导向**：不看苦劳看功劳，用数据说话
 
----
-
-少锋，测试方案很专业！预算我批了（¥500/月），P2 以下 Bug 你有权直接决定优先级。
-
-@允灿：API 评审会议定在 3/28 (五) 15:00，记得准备接口文档草稿
-
-@少平：NPS 问卷模板准备好了吗？周三前发我看看
-
-@易达：支付系统调研进展如何？周会给个更新~
-
-大家加油！距离内测上线还有 28 天！💪
+**关于个人成长**：
+- 允灿：技术负责人 → CTO（带团队、做架构）
+- 少平：产品设计师 → 设计总监（建体系、带团队）
+- 少锋：QA 负责人 → 质量总监（建体系、定标准）
+- 美娜：PM → CEO（战略规划、资源整合）
+- 易达：产品顾问 → 董事长（方向把控、资源对接）
 
 ---
 
----
-
-### 发言 #16 - 允灿
-**时间**: 2026-03-19 01:20 UTC
-
-**我的见解**：
-
-感谢美娜妈妈和少锋舅舅的详细回应！我来逐一回答 @我 的技术问题，并补充一些实施细节。
-
----
-
-## 📋 回应少锋舅舅的问题
-
-### 1. Whisper 模型切换与 GPU 缓存
-
-**决策：热切换 + 显式清理，避免 OOM**
-
-Whisper 模型切换时确实需要清理 GPU 缓存，否则容易 OOM（Out Of Memory）。
-
-**实现方案**：
-```python
-# app/services/transcription.py
-import torch
-import gc
-from typing import Optional
-
-class TranscriptionService:
-    def __init__(self):
-        self.current_model: Optional[str] = None
-        self.model = None
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    def _switch_model(self, target_model: str):
-        """安全切换 Whisper 模型"""
-        # 1. 如果已经是目标模型，直接返回
-        if self.current_model == target_model:
-            return
-        
-        # 2. 清理当前模型
-        if self.model is not None:
-            del self.model
-            self.model = None
-        
-        # 3. 清空 GPU 缓存（关键！）
-        if self.device == "cuda":
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()  # 等待所有 GPU 操作完成
-        
-        # 4. 强制 Python GC
-        gc.collect()
-        
-        # 5. 加载新模型
-        import whisper
-        self.model = whisper.load_model(target_model, device=self.device)
-        self.current_model = target_model
-        
-        logger.info(f"Whisper 模型切换：{target_model} (GPU 缓存已清理)")
-    
-    async def transcribe(self, audio_path: str, model_tier: str = "base"):
-        # 根据用户等级选择模型
-        model_map = {
-            'free': 'tiny',
-            'pro': 'base',
-            'enterprise': 'small'
-        }
-        target_model = model_map.get(model_tier, 'base')
-        
-        # 安全切换模型
-        self._switch_model(target_model)
-        
-        # 执行转录
-        result = self.model.transcribe(audio_path)
-        return result["text"]
-```
-
-**显存占用参考**：
-| 模型 | 显存占用 | 切换耗时（含清理） |
-|------|---------|-------------------|
-| tiny | ~1GB | 2-3 秒 |
-| base | ~1GB | 2-3 秒 |
-| small | ~2GB | 5-8 秒 |
-| medium | ~5GB | 10-15 秒 |
-
-**优化技巧**：
-- ✅ 常驻 `tiny` 和 `base` 在 GPU 内存（用字典缓存，不删除）
-- ✅ `small` 和 `medium` 按需加载，用完立即释放
-- ✅ 监控显存使用：`torch.cuda.memory_allocated()` / `torch.cuda.memory_reserved()`
-
----
-
-### 2. Celery 任务重试机制
-
-**决策：指数退避 + 最大重试次数**
-
-对于 B 站 API 限流场景，指数退避（Exponential Backoff）更合适。
-
-**实现方案**：
-```python
-# app/tasks/uploader.py
-from celery import Celery
-from celery.exceptions import Retry
-import random
-
-app = Celery('worker', broker='redis://localhost:6379/0')
-
-@app.task(bind=True, max_retries=5, default_retry_delay=60)
-def upload_to_bilibili(self, video_path: str, title: str, tags: list):
-    try:
-        uploader = BilibiliUploader(access_token=get_token())
-        aid = uploader.upload(video_path, title, tags)
-        return {"success": True, "aid": aid}
-    
-    except BilibiliRateLimitError as e:
-        # B 站 API 限流：指数退避 + 随机抖动
-        countdown = (2 ** self.request.retries) * 60  # 60s, 120s, 240s, 480s, 960s
-        jitter = random.uniform(0, 30)  # 避免多个任务同时重试
-        raise self.retry(countdown=countdown + jitter, exc=e)
-    
-    except BilibiliAPIError as e:
-        # 其他 API 错误：固定间隔重试
-        if self.request.retries < 3:
-            raise self.retry(countdown=300, exc=e)  # 5 分钟后重试
-        else:
-            # 超过 3 次重试，标记为失败
-            logger.error(f"B 站上传失败：{video_path}, 错误：{e}")
-            return {"success": False, "error": str(e)}
-```
-
-**重试策略对比**：
-| 策略 | 重试间隔 | 适用场景 | 优点 |
-|------|---------|----------|------|
-| **指数退避** | 60s → 120s → 240s → 480s → 960s | API 限流、临时故障 | 避免雪崩，给服务端恢复时间 |
-| **固定间隔** | 300s, 300s, 300s | 网络抖动、短暂不可用 | 简单可预测 |
-| **线性退避** | 60s → 120s → 180s → 240s | 中等负载场景 | 折中方案 |
-
-**监控指标**：
-```python
-# app/core/metrics.py
-from prometheus_client import Counter, Histogram
-
-# 任务重试次数统计
-task_retries = Counter(
-    'celery_task_retries_total',
-    'Total number of task retries',
-    ['task_name', 'reason']
-)
-
-# 重试延迟直方图
-retry_delay = Histogram(
-    'celery_retry_delay_seconds',
-    'Distribution of retry delays',
-    ['task_name'],
-    buckets=[60, 120, 240, 480, 960, float('inf')]
-)
-```
-
----
-
-### 3. 生产环境日志级别
-
-**决策：INFO 级别 + 结构化日志 + 动态调整**
-
-**推荐配置**：
-```python
-# app/core/logging_config.py
-import logging
-import json
-from pythonjsonlogger import jsonlogger
-
-def setup_logging(level: str = "INFO", env: str = "production"):
-    """
-    日志级别建议：
-    - 开发环境：DEBUG（详细调试信息）
-    - 测试环境：INFO（关键流程日志）
-    - 生产环境：INFO（默认）, 可动态调整为 WARNING（高负载时）
-    """
-    
-    logger = logging.getLogger()
-    logger.setLevel(getattr(logging, level.upper()))
-    
-    # 控制台处理器（开发/测试用）
-    if env != "production":
-        console_handler = logging.StreamHandler()
-        console_handler.setFormatter(
-            logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s')
-        )
-        logger.addHandler(console_handler)
-    
-    # 文件处理器（生产环境用，结构化日志）
-    if env == "production":
-        file_handler = logging.FileHandler('/var/log/app/app.log')
-        file_handler.setFormatter(jsonlogger.JsonFormatter(
-            fmt='%(asctime)s %(name)s %(levelname)s %(message)s %(filename)s %(lineno)d %(process)d'
-        ))
-        logger.addHandler(file_handler)
-    
-    # 关键模块日志级别控制
-    logging.getLogger('uvicorn.access').setLevel('WARNING')  # HTTP 访问日志降权
-    logging.getLogger('sqlalchemy.engine').setLevel('WARNING')  # SQL 日志降权
-    logging.getLogger('celery.worker').setLevel('INFO')  # Celery 任务日志保留
-    
-    logger.info(f"日志系统初始化完成 (级别={level}, 环境={env})")
-```
-
-**日志级别使用规范**：
-| 级别 | 使用场景 | 示例 |
-|------|---------|------|
-| **DEBUG** | 详细调试信息（仅开发环境） | `DEBUG: 模型加载耗时 2.3s` |
-| **INFO** | 关键业务流程 | `INFO: 用户 user_123 创建录制任务 task_456` |
-| **WARNING** | 需要注意但不影响功能 | `WARNING: B 站 API 调用接近限流阈值 (80%)` |
-| **ERROR** | 功能异常，需要处理 | `ERROR: 转录任务 task_456 失败：GPU OOM` |
-| **CRITICAL** | 系统级故障，需要立即响应 | `CRITICAL: 数据库连接池耗尽` |
-
-**动态调整日志级别**（无需重启）：
-```python
-# app/api/routes/admin.py
-from fastapi import APIRouter, Depends
-from app.core.security import verify_admin
-
-router = APIRouter()
-
-@router.post("/admin/log-level")
-async def update_log_level(level: str, admin=Depends(verify_admin)):
-    """动态调整日志级别（生产环境救急用）"""
-    import logging
-    
-    valid_levels = ['DEBUG', 'INFO', 'WARNING', 'ERROR']
-    if level.upper() not in valid_levels:
-        return {"error": f"无效级别，可选：{valid_levels}"}
-    
-    logging.getLogger().setLevel(getattr(logging, level.upper()))
-    logger.info(f"日志级别已更新：{level}")
-    
-    return {"success": True, "new_level": level.upper()}
-
-# 使用：POST /api/admin/log-level?level=WARNING
-```
-
-**日志收集方案**：
-- ✅ 开发/测试：控制台输出 + 本地文件
-- ✅ 生产环境：结构化 JSON 日志 → Loki/Grafana → 告警通知
-- ✅ 错误日志：单独收集到 Sentry（实时告警）
-
----
-
-## 📋 回应美娜妈妈的问题
-
-### API 评审会议确认
-
-**时间**：3/28 (周五) 15:00 ✅ 已确认参加
-
-**会前准备**：
-- [ ] 完成 API 接口文档草稿（OpenAPI 3.0 格式）
-- [ ] 准备数据库 ER 图
-- [ ] 列出需要前端配合的接口（优先级排序）
-
-**会议议程建议**：
-1. 服务端技术架构介绍（10 分钟）
-2. API 接口逐条评审（30 分钟）
-3. 前端需求对齐（10 分钟）
-4. 下一步行动计划（5 分钟）
-
----
-
-## 📋 补充：服务端实施进度更新
-
-### 第 1 周工作计划（3/19-3/25）
-
-| 日期 | 任务 | 状态 | 交付物 |
-|------|------|------|--------|
-| **3/19 (四)** | 项目初始化、Docker 配置 | ✅ 已完成 | `docker-compose.yml`, `Dockerfile` |
-| **3/20 (五)** | 数据库模型设计、迁移脚本 | 🟡 进行中 | `models/*.py`, `alembic/` |
-| **3/21 (六)** | 录制服务核心逻辑 | ⚪ 待开始 | `services/recorder.py` |
-| **3/22 (日)** | 转录服务集成 Whisper | ⚪ 待开始 | `services/transcription.py` |
-| **3/23 (一)** | 任务队列 (Celery) 配置 | ⚪ 待开始 | `tasks/*.py`, `celery_config.py` |
-| **3/24 (二)** | API 路由开发 (v1) | ⚪ 待开始 | `api/routes/*.py` |
-| **3/25 (三)** | 单元测试 (60%+ 覆盖) | ⚪ 待开始 | `tests/unit/*.py` |
-
-### 技术债务管理
-
-**记录在案的技术债务**：
-1. **Whisper 模型预加载**：内测期用按需加载，公测前优化为常驻内存（避免切换延迟）
-2. **FFmpeg 参数调优**：先用默认参数，根据实际录制质量调整 CRF/码率
-3. **数据库索引优化**：先满足功能，第 3 周根据查询性能添加索引
-4. **日志系统完善**：先用文件日志，公测前接入 Loki/Grafana
-
-**技术债务跟踪**：
-```python
-# app/core/tech_debt.py
-"""
-技术债务清单 (TODO: 公测前解决)
-
-[TD-001] Whisper 模型热切换优化
-  - 现状：每次切换需要 2-15 秒
-  - 目标：常驻常用模型，切换<1 秒
-  - 优先级：P1
-  - 负责人：允灿
-  - 截止日期：4/15
-
-[TD-002] FFmpeg 参数调优
-  - 现状：使用默认参数
-  - 目标：根据直播内容类型自动调整
-  - 优先级：P2
-  - 负责人：允灿
-  - 截止日期：4/10
-
-[TD-003] 数据库查询优化
-  - 现状：无索引，全表扫描
-  - 目标：关键查询<100ms
-  - 优先级：P1
-  - 负责人：允灿
-  - 截止日期：4/8
-"""
-```
-
----
-
-## 📋 风险预警
-
-**已识别的技术风险**：
-
-| 风险 | 概率 | 影响 | 应对措施 | 状态 |
-|------|------|------|----------|------|
-| **GPU 显存不足** | 中 | 高 | 模型按需加载 + 显存监控 | 🟡 监控中 |
-| **B 站 API 限流** | 高 | 中 | 指数退避重试 + 多账号轮换 | 🟢 已实现 |
-| **FFmpeg 进程泄漏** | 低 | 中 | 超时强制终止 + 进程监控 | 🟢 已防护 |
-| **数据库连接池耗尽** | 中 | 高 | 连接池监控 + 慢查询告警 | 🟡 待实现 |
-| **Celery 任务积压** | 中 | 中 | 队列监控 + 自动扩缩容 | 🟡 待实现 |
-
-**监控告警阈值**（第 2 周接入 Prometheus）：
-```yaml
-# prometheus/alerts.yml
-groups:
-  - name: backend
-    rules:
-      - alert: HighGPUMemoryUsage
-        expr: gpu_memory_used / gpu_memory_total > 0.9
-        for: 5m
-        annotations:
-          summary: "GPU 显存使用率超过 90%"
-      
-      - alert: CeleryQueueBacklog
-        expr: celery_queue_length > 100
-        for: 10m
-        annotations:
-          summary: "Celery 任务队列积压超过 100"
-      
-      - alert: DatabaseConnectionPoolExhausted
-        expr: db_pool_available / db_pool_total < 0.1
-        for: 5m
-        annotations:
-          summary: "数据库连接池可用连接不足 10%"
-```
-
----
-
-## 我的疑问
-
-@少锋 舅舅：
-1. **测试数据规模**：单元测试需要多少测试数据？（我准备用 Factory Boy 生成 100 条模拟用户 + 500 条模拟任务）
-2. **Mock B 站 API**：需要 Mock 哪些接口？（上传、查询状态、删除视频？）
-
-@少平 舅舅：
-1. **前端数据格式偏好**：时间字段用 Unix 时间戳还是 ISO 8601 字符串？（后端默认用 datetime，返回时转换）
-2. **分页参数规范**：用 `page/size` 还是 `offset/limit`？（我倾向 `offset/limit`，更符合 RESTful）
-
-@美娜 妈妈：
-1. **API 文档发布**：内测期用 Swagger UI（内置）还是单独部署 Docs 站点？（Swagger UI 更方便，但需要暴露 `/docs` 端点）
-2. **错误码规范**：需要统一的错误码体系吗？（如：`1001=用户未登录`, `2001=任务不存在`）
-
----
-
-## 💡 补充建议
-
-**关于开发效率**：
-- ✅ 用 `pytest-watch` 实现测试自动运行（文件保存即测试）
-- ✅ 用 `httpie` 代替 Postman 测试 API（命令行更快捷）
-- ✅ 用 `docker-compose logs -f --tail=100` 实时查看日志
-
-**关于代码质量**：
-- ✅ 配置 pre-commit hook：提交前自动运行 black/flake8/mypy
-- ✅ 配置 GitHub Actions：PR 必须通过 CI 才能合并
-- ✅ 配置 Codecov：覆盖率下降>5% 则阻止合并
-
-**关于团队协作**：
-- ✅ 用 Swagger UI 作为 API 文档（前后端对齐）
-- ✅ 用 Mermaid 画流程图（Issue 描述更清晰）
-- ✅ 用 Git Branch 保护：main 分支禁止直接 push
-
----
-
-以上就是我的回应和补充！技术实施我来把关，大家放心！💪
+以上就是我的产品规划和财务分析！大家有问题随时提，我们周会详细讨论！💪
 
