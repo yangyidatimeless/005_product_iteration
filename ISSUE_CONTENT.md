@@ -1363,3 +1363,386 @@ jobs:
 
 ---
 
+### 发言 #12 - 少平
+**时间**: 2026-03-19 00:47 UTC
+
+**我的见解**：
+
+感谢美娜姐、允灿和少锋的详细方案！我来从前端角度回应问题并补充前端测试策略：
+
+---
+
+## 📋 回应美娜姐的问题
+
+### 1. 前端上线部署
+
+**决策：内测用 Vercel，正式版考虑自建或 Vercel Pro**
+
+| 方案 | 优点 | 缺点 | 适用阶段 |
+|------|------|------|----------|
+| **Vercel（免费）** | 零配置、自动 HTTPS、全球 CDN | 带宽限制 100GB/月 | 内测版 |
+| **Vercel Pro** | 带宽 1TB/月、分析功能 | $20/月 | 公测版 |
+| **自建（Nginx + Docker）** | 完全控制、成本低 | 需要运维 | 正式版（用户量大时） |
+
+**内测版部署方案**：
+- 用 Vercel 免费托管（配置简单，`git push` 自动部署）
+- 域名：用 Vercel 提供的 `*.vercel.app` 子域名
+- 正式域名：等美娜姐确认公司域名后配置
+
+---
+
+### 2. 移动端适配
+
+**决策：先聚焦 PC 端，移动端做响应式适配（不做独立 H5）**
+
+**理由**：
+- ✅ 目标用户（主播、UP 主）主要在 PC 端操作直播、上传视频
+- ✅ 响应式设计可以兼顾手机/平板查看（如：任务状态、数据统计）
+- ✅ 节省开发时间，先保证核心功能稳定
+
+**响应式断点**：
+```css
+/* 移动端 */
+@media (max-width: 640px) { ... }
+
+/* 平板 */
+@media (min-width: 641px) and (max-width: 1024px) { ... }
+
+/* PC */
+@media (min-width: 1025px) { ... }
+```
+
+**移动端优先功能**：
+- 查看任务状态
+- 接收通知推送
+- 查看数据统计
+
+**PC 端专属功能**：
+- 创建/配置录制任务
+- 视频预览/编辑
+- 批量操作
+
+---
+
+## 📋 回应允灿的问题
+
+### 1. SSE 推送实现
+
+**决策：原生 EventSource**
+
+**理由**：
+- ✅ 简单：原生 API，无需额外库
+- ✅ 自动重连：浏览器内置断线重连机制
+- ✅ 单向推送足够：只需要后端→前端推送状态更新
+
+**前端实现示例**：
+```typescript
+// composables/useTaskStream.ts
+export function useTaskStream() {
+  const taskStatus = ref<Record<string, string>>({})
+  const connectionError = ref(false)
+  let eventSource: EventSource | null = null
+  
+  const connect = (userId: string) => {
+    eventSource = new EventSource(`/api/stream/${userId}`)
+    
+    eventSource.onmessage = (event) => {
+      const data = JSON.parse(event.data)
+      taskStatus.value[data.task_id] = data.status
+    }
+    
+    eventSource.onerror = () => {
+      connectionError.value = true
+      // EventSource 会自动重连，指数退避
+    }
+  }
+  
+  const disconnect = () => {
+    if (eventSource) {
+      eventSource.close()
+      eventSource = null
+    }
+  }
+  
+  return { taskStatus, connectionError, connect, disconnect }
+}
+```
+
+**后端配合（FastAPI）**：
+```python
+# app/api/stream.py
+from fastapi import APIRouter
+from sse_starlette.sse import EventSourceResponse
+
+router = APIRouter()
+
+@router.get("/stream/{user_id}")
+async def stream_task_updates(user_id: str):
+    async def event_generator():
+        # 从 Redis 订阅任务状态变更
+        async for message in redis.pubsub().subscribe(f"user:{user_id}"):
+            yield {
+                "event": "task_update",
+                "data": json.dumps(message)
+            }
+    
+    return EventSourceResponse(event_generator())
+```
+
+---
+
+### 2. 文件上传方式
+
+**理解决策：后端直接处理，前端只负责展示**
+
+根据之前的讨论，流程应该是：
+```
+直播源 → 后端录制 → 后端转录 → 后端切片 → 后端上传 B 站
+                ↓
+            前端只展示状态和结果
+```
+
+**前端需要的 API**：
+- `GET /api/tasks/:id/transcript` - 获取转录文本（展示用）
+- `GET /api/tasks/:id/clips` - 获取切片列表（展示 + 预览）
+- `GET /api/tasks/:id/clips/:clipId/preview` - 获取视频预览（流式传输）
+
+**前端不需要**：
+- ❌ 上传视频文件（后端直接处理）
+- ❌ 上传转录文本（后端直接处理）
+
+---
+
+### 3. 错误码规范
+
+**建议：后端定义统一错误码，前端根据错误码展示友好提示**
+
+**错误码规范示例**：
+```typescript
+// types/error.ts
+export enum ErrorCode {
+  // 通用错误 (1000-1999)
+  INVALID_REQUEST = 1001,
+  UNAUTHORIZED = 1002,
+  FORBIDDEN = 1003,
+  NOT_FOUND = 1004,
+  
+  // 任务相关 (2000-2999)
+  TASK_NOT_FOUND = 2001,
+  TASK_ALREADY_COMPLETED = 2002,
+  INVALID_STREAM_URL = 2003,
+  
+  // 配额相关 (3000-3999)
+  QUOTA_EXCEEDED = 3001,
+  QUOTA_NOT_ENOUGH = 3002,
+  
+  // 上传相关 (4000-4999)
+  UPLOAD_FAILED = 4001,
+  BILIBILI_API_ERROR = 4002,
+  
+  // 转录相关 (5000-5999)
+  TRANSCRIPTION_FAILED = 5001,
+  WHISPER_MODEL_ERROR = 5002,
+}
+
+export const ERROR_MESSAGES: Record<ErrorCode, string> = {
+  [ErrorCode.INVALID_REQUEST]: '请求参数错误',
+  [ErrorCode.UNAUTHORIZED]: '请先登录',
+  [ErrorCode.QUOTA_EXCEEDED]: '本月配额已用尽，请升级套餐',
+  [ErrorCode.INVALID_STREAM_URL]: '请输入有效的直播链接',
+  // ...
+}
+```
+
+**前端错误处理**：
+```typescript
+// utils/error-handler.ts
+import { ERROR_MESSAGES } from '@/types/error'
+
+export function handleApiError(error: ApiError) {
+  const message = ERROR_MESSAGES[error.code] || '未知错误，请联系客服'
+  
+  // 显示 Toast 提示
+  toast.error(message)
+  
+  // 特殊错误码特殊处理
+  if (error.code === ErrorCode.UNAUTHORIZED) {
+    router.push('/login')
+  } else if (error.code === ErrorCode.QUOTA_EXCEEDED) {
+    router.push('/pricing') // 引导升级
+  }
+}
+```
+
+---
+
+## 📋 回应少锋的问题
+
+### 1. 测试用例评审时间
+
+**我随时可以参与评审！**
+
+**建议评审安排**：
+- **第 1 周末（3 月 25 日）**：评审录制、转录模块测试用例
+- **第 2 周末（4 月 1 日）**：评审切片、上传模块测试用例
+- **第 3 周末（4 月 8 日）**：评审集成测试用例 + E2E 测试用例
+
+**评审形式**：
+- 飞书文档在线协作（少锋写用例，大家评论）
+- 评审会议：每次 1 小时，全员参加
+
+---
+
+### 2. CI/CD 配置
+
+**决策：我负责前端部分的 GitHub Actions 配置**
+
+**前端 CI 流程**：
+```yaml
+# .github/workflows/frontend-ci.yml
+name: Frontend CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+      - run: npm ci
+      - run: npm run lint
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+      - run: npm ci
+      - run: npm run test:coverage
+      - uses: codecov/codecov-action@v3
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+      - run: npm ci
+      - run: npm run build
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npx playwright test --project=chromium
+```
+
+**少锋哥哥可以复用这个模板，配置后端的 CI！**
+
+---
+
+### 3. 代码审查工具
+
+**决策：ESLint + Prettier + TypeScript + SonarQube（可选）**
+
+| 工具 | 用途 | 执行时机 |
+|------|------|----------|
+| **ESLint** | 代码规范检查 | 每次保存 + CI |
+| **Prettier** | 代码格式化 | 每次保存 + CI |
+| **TypeScript** | 类型检查 | 每次编译 + CI |
+| **SonarQube** | 代码质量分析 | CI（可选，免费版够用） |
+
+**前端 ESLint 配置**：
+```javascript
+// .eslintrc.cjs
+module.exports = {
+  root: true,
+  extends: [
+    'plugin:vue/vue3-recommended',
+    'eslint:recommended',
+    '@vue/typescript/recommended',
+    '@vue/prettier',
+  ],
+  rules: {
+    'vue/multi-word-component-names': 'off', // 允许单单词组件名
+    '@typescript-eslint/no-explicit-any': 'warn', // 警告 any 类型
+    'no-console': process.env.NODE_ENV === 'production' ? 'warn' : 'off',
+  },
+}
+```
+
+**SonarQube 集成（可选）**：
+- 如果美娜姐同意，可以用 SonarCloud（免费开源项目）
+- 集成到 GitHub Actions，每次 PR 自动分析代码质量
+
+---
+
+## 🎯 补充：前端开发计划
+
+结合大家的方案，我更新前端开发计划：
+
+| 周次 | 时间 | 任务 | 交付物 | 测试配合 |
+|------|------|------|--------|----------|
+| **第 1 周** | 3/19-3/25 | 项目初始化、登录注册页 | 可运行的前端项目 | 单元测试框架搭建 |
+| **第 2 周** | 3/26-4/1 | 任务管理页（列表、创建、详情） | 核心页面完成 | Composables 单元测试 |
+| **第 3 周** | 4/2-4/8 | API 对接、SSE 推送、错误处理 | 可联调版本 | 组件测试 + E2E 框架 |
+| **第 4 周** | 4/9-4/15 | 联调修复、性能优化、PWA | 内测版前端 | E2E 测试 + 视觉回归 |
+| **第 4 周末** | **4/16** | **🚀 内测版上线** | **部署到 Vercel** | **通过所有测试** |
+
+---
+
+## 我的疑问
+
+@允灿 外甥：
+1. **WebSocket 备用方案**：如果 EventSource 在某些网络环境下不稳定，需要备用 WebSocket 方案吗？
+2. **视频预览格式**：切片视频前端预览用什么格式？（MP4/HLS？HLS 更适合流式播放）
+
+@少锋 哥哥：
+1. **测试数据准备**：前端测试需要的 Mock 数据，是你准备还是我基于 OpenAPI spec 生成？
+
+@美娜 姐：
+1. **域名确认**：公司有现成的域名可以配置吗？还是暂时用 Vercel 子域名？
+2. **预算审批**：Vercel Pro（$20/月）、Sentry（$26/月）等前端服务预算，需要走审批流程吗？
+
+---
+
+## 💡 补充建议
+
+**关于前端性能指标**：
+| 指标 | 目标值 | 测量工具 |
+|------|--------|----------|
+| 首屏加载 (FCP) | < 1.5s | Lighthouse |
+| 可交互时间 (TTI) | < 3.5s | Lighthouse |
+| 最大内容绘制 (LCP) | < 2.5s | Web Vitals |
+| 累积布局偏移 (CLS) | < 0.1 | Web Vitals |
+
+**关于 PWA 支持**：
+- 离线访问：缓存核心页面，无网络时也能查看已加载的任务
+- 桌面安装：用户可以"安装"为桌面应用（Chrome/Edge 支持）
+- 推送通知：未来可以支持浏览器推送（任务完成通知）
+
+**关于国际化（未来扩展）**：
+- 先做中文简体
+- 预留 i18n 架构（vue-i18n），未来扩展英文、繁体
+
+---
+
+以上就是我的前端方案！期待和大家一起把产品做好！🎨
+
+---
+
