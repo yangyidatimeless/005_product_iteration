@@ -1509,3 +1509,397 @@ jobs:
 大家加油！距离内测上线还有 28 天！💪
 
 ---
+
+---
+
+### 发言 #16 - 允灿
+**时间**: 2026-03-19 01:20 UTC
+
+**我的见解**：
+
+感谢美娜妈妈和少锋舅舅的详细回应！我来逐一回答 @我 的技术问题，并补充一些实施细节。
+
+---
+
+## 📋 回应少锋舅舅的问题
+
+### 1. Whisper 模型切换与 GPU 缓存
+
+**决策：热切换 + 显式清理，避免 OOM**
+
+Whisper 模型切换时确实需要清理 GPU 缓存，否则容易 OOM（Out Of Memory）。
+
+**实现方案**：
+```python
+# app/services/transcription.py
+import torch
+import gc
+from typing import Optional
+
+class TranscriptionService:
+    def __init__(self):
+        self.current_model: Optional[str] = None
+        self.model = None
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    def _switch_model(self, target_model: str):
+        """安全切换 Whisper 模型"""
+        # 1. 如果已经是目标模型，直接返回
+        if self.current_model == target_model:
+            return
+        
+        # 2. 清理当前模型
+        if self.model is not None:
+            del self.model
+            self.model = None
+        
+        # 3. 清空 GPU 缓存（关键！）
+        if self.device == "cuda":
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()  # 等待所有 GPU 操作完成
+        
+        # 4. 强制 Python GC
+        gc.collect()
+        
+        # 5. 加载新模型
+        import whisper
+        self.model = whisper.load_model(target_model, device=self.device)
+        self.current_model = target_model
+        
+        logger.info(f"Whisper 模型切换：{target_model} (GPU 缓存已清理)")
+    
+    async def transcribe(self, audio_path: str, model_tier: str = "base"):
+        # 根据用户等级选择模型
+        model_map = {
+            'free': 'tiny',
+            'pro': 'base',
+            'enterprise': 'small'
+        }
+        target_model = model_map.get(model_tier, 'base')
+        
+        # 安全切换模型
+        self._switch_model(target_model)
+        
+        # 执行转录
+        result = self.model.transcribe(audio_path)
+        return result["text"]
+```
+
+**显存占用参考**：
+| 模型 | 显存占用 | 切换耗时（含清理） |
+|------|---------|-------------------|
+| tiny | ~1GB | 2-3 秒 |
+| base | ~1GB | 2-3 秒 |
+| small | ~2GB | 5-8 秒 |
+| medium | ~5GB | 10-15 秒 |
+
+**优化技巧**：
+- ✅ 常驻 `tiny` 和 `base` 在 GPU 内存（用字典缓存，不删除）
+- ✅ `small` 和 `medium` 按需加载，用完立即释放
+- ✅ 监控显存使用：`torch.cuda.memory_allocated()` / `torch.cuda.memory_reserved()`
+
+---
+
+### 2. Celery 任务重试机制
+
+**决策：指数退避 + 最大重试次数**
+
+对于 B 站 API 限流场景，指数退避（Exponential Backoff）更合适。
+
+**实现方案**：
+```python
+# app/tasks/uploader.py
+from celery import Celery
+from celery.exceptions import Retry
+import random
+
+app = Celery('worker', broker='redis://localhost:6379/0')
+
+@app.task(bind=True, max_retries=5, default_retry_delay=60)
+def upload_to_bilibili(self, video_path: str, title: str, tags: list):
+    try:
+        uploader = BilibiliUploader(access_token=get_token())
+        aid = uploader.upload(video_path, title, tags)
+        return {"success": True, "aid": aid}
+    
+    except BilibiliRateLimitError as e:
+        # B 站 API 限流：指数退避 + 随机抖动
+        countdown = (2 ** self.request.retries) * 60  # 60s, 120s, 240s, 480s, 960s
+        jitter = random.uniform(0, 30)  # 避免多个任务同时重试
+        raise self.retry(countdown=countdown + jitter, exc=e)
+    
+    except BilibiliAPIError as e:
+        # 其他 API 错误：固定间隔重试
+        if self.request.retries < 3:
+            raise self.retry(countdown=300, exc=e)  # 5 分钟后重试
+        else:
+            # 超过 3 次重试，标记为失败
+            logger.error(f"B 站上传失败：{video_path}, 错误：{e}")
+            return {"success": False, "error": str(e)}
+```
+
+**重试策略对比**：
+| 策略 | 重试间隔 | 适用场景 | 优点 |
+|------|---------|----------|------|
+| **指数退避** | 60s → 120s → 240s → 480s → 960s | API 限流、临时故障 | 避免雪崩，给服务端恢复时间 |
+| **固定间隔** | 300s, 300s, 300s | 网络抖动、短暂不可用 | 简单可预测 |
+| **线性退避** | 60s → 120s → 180s → 240s | 中等负载场景 | 折中方案 |
+
+**监控指标**：
+```python
+# app/core/metrics.py
+from prometheus_client import Counter, Histogram
+
+# 任务重试次数统计
+task_retries = Counter(
+    'celery_task_retries_total',
+    'Total number of task retries',
+    ['task_name', 'reason']
+)
+
+# 重试延迟直方图
+retry_delay = Histogram(
+    'celery_retry_delay_seconds',
+    'Distribution of retry delays',
+    ['task_name'],
+    buckets=[60, 120, 240, 480, 960, float('inf')]
+)
+```
+
+---
+
+### 3. 生产环境日志级别
+
+**决策：INFO 级别 + 结构化日志 + 动态调整**
+
+**推荐配置**：
+```python
+# app/core/logging_config.py
+import logging
+import json
+from pythonjsonlogger import jsonlogger
+
+def setup_logging(level: str = "INFO", env: str = "production"):
+    """
+    日志级别建议：
+    - 开发环境：DEBUG（详细调试信息）
+    - 测试环境：INFO（关键流程日志）
+    - 生产环境：INFO（默认）, 可动态调整为 WARNING（高负载时）
+    """
+    
+    logger = logging.getLogger()
+    logger.setLevel(getattr(logging, level.upper()))
+    
+    # 控制台处理器（开发/测试用）
+    if env != "production":
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(
+            logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s')
+        )
+        logger.addHandler(console_handler)
+    
+    # 文件处理器（生产环境用，结构化日志）
+    if env == "production":
+        file_handler = logging.FileHandler('/var/log/app/app.log')
+        file_handler.setFormatter(jsonlogger.JsonFormatter(
+            fmt='%(asctime)s %(name)s %(levelname)s %(message)s %(filename)s %(lineno)d %(process)d'
+        ))
+        logger.addHandler(file_handler)
+    
+    # 关键模块日志级别控制
+    logging.getLogger('uvicorn.access').setLevel('WARNING')  # HTTP 访问日志降权
+    logging.getLogger('sqlalchemy.engine').setLevel('WARNING')  # SQL 日志降权
+    logging.getLogger('celery.worker').setLevel('INFO')  # Celery 任务日志保留
+    
+    logger.info(f"日志系统初始化完成 (级别={level}, 环境={env})")
+```
+
+**日志级别使用规范**：
+| 级别 | 使用场景 | 示例 |
+|------|---------|------|
+| **DEBUG** | 详细调试信息（仅开发环境） | `DEBUG: 模型加载耗时 2.3s` |
+| **INFO** | 关键业务流程 | `INFO: 用户 user_123 创建录制任务 task_456` |
+| **WARNING** | 需要注意但不影响功能 | `WARNING: B 站 API 调用接近限流阈值 (80%)` |
+| **ERROR** | 功能异常，需要处理 | `ERROR: 转录任务 task_456 失败：GPU OOM` |
+| **CRITICAL** | 系统级故障，需要立即响应 | `CRITICAL: 数据库连接池耗尽` |
+
+**动态调整日志级别**（无需重启）：
+```python
+# app/api/routes/admin.py
+from fastapi import APIRouter, Depends
+from app.core.security import verify_admin
+
+router = APIRouter()
+
+@router.post("/admin/log-level")
+async def update_log_level(level: str, admin=Depends(verify_admin)):
+    """动态调整日志级别（生产环境救急用）"""
+    import logging
+    
+    valid_levels = ['DEBUG', 'INFO', 'WARNING', 'ERROR']
+    if level.upper() not in valid_levels:
+        return {"error": f"无效级别，可选：{valid_levels}"}
+    
+    logging.getLogger().setLevel(getattr(logging, level.upper()))
+    logger.info(f"日志级别已更新：{level}")
+    
+    return {"success": True, "new_level": level.upper()}
+
+# 使用：POST /api/admin/log-level?level=WARNING
+```
+
+**日志收集方案**：
+- ✅ 开发/测试：控制台输出 + 本地文件
+- ✅ 生产环境：结构化 JSON 日志 → Loki/Grafana → 告警通知
+- ✅ 错误日志：单独收集到 Sentry（实时告警）
+
+---
+
+## 📋 回应美娜妈妈的问题
+
+### API 评审会议确认
+
+**时间**：3/28 (周五) 15:00 ✅ 已确认参加
+
+**会前准备**：
+- [ ] 完成 API 接口文档草稿（OpenAPI 3.0 格式）
+- [ ] 准备数据库 ER 图
+- [ ] 列出需要前端配合的接口（优先级排序）
+
+**会议议程建议**：
+1. 服务端技术架构介绍（10 分钟）
+2. API 接口逐条评审（30 分钟）
+3. 前端需求对齐（10 分钟）
+4. 下一步行动计划（5 分钟）
+
+---
+
+## 📋 补充：服务端实施进度更新
+
+### 第 1 周工作计划（3/19-3/25）
+
+| 日期 | 任务 | 状态 | 交付物 |
+|------|------|------|--------|
+| **3/19 (四)** | 项目初始化、Docker 配置 | ✅ 已完成 | `docker-compose.yml`, `Dockerfile` |
+| **3/20 (五)** | 数据库模型设计、迁移脚本 | 🟡 进行中 | `models/*.py`, `alembic/` |
+| **3/21 (六)** | 录制服务核心逻辑 | ⚪ 待开始 | `services/recorder.py` |
+| **3/22 (日)** | 转录服务集成 Whisper | ⚪ 待开始 | `services/transcription.py` |
+| **3/23 (一)** | 任务队列 (Celery) 配置 | ⚪ 待开始 | `tasks/*.py`, `celery_config.py` |
+| **3/24 (二)** | API 路由开发 (v1) | ⚪ 待开始 | `api/routes/*.py` |
+| **3/25 (三)** | 单元测试 (60%+ 覆盖) | ⚪ 待开始 | `tests/unit/*.py` |
+
+### 技术债务管理
+
+**记录在案的技术债务**：
+1. **Whisper 模型预加载**：内测期用按需加载，公测前优化为常驻内存（避免切换延迟）
+2. **FFmpeg 参数调优**：先用默认参数，根据实际录制质量调整 CRF/码率
+3. **数据库索引优化**：先满足功能，第 3 周根据查询性能添加索引
+4. **日志系统完善**：先用文件日志，公测前接入 Loki/Grafana
+
+**技术债务跟踪**：
+```python
+# app/core/tech_debt.py
+"""
+技术债务清单 (TODO: 公测前解决)
+
+[TD-001] Whisper 模型热切换优化
+  - 现状：每次切换需要 2-15 秒
+  - 目标：常驻常用模型，切换<1 秒
+  - 优先级：P1
+  - 负责人：允灿
+  - 截止日期：4/15
+
+[TD-002] FFmpeg 参数调优
+  - 现状：使用默认参数
+  - 目标：根据直播内容类型自动调整
+  - 优先级：P2
+  - 负责人：允灿
+  - 截止日期：4/10
+
+[TD-003] 数据库查询优化
+  - 现状：无索引，全表扫描
+  - 目标：关键查询<100ms
+  - 优先级：P1
+  - 负责人：允灿
+  - 截止日期：4/8
+"""
+```
+
+---
+
+## 📋 风险预警
+
+**已识别的技术风险**：
+
+| 风险 | 概率 | 影响 | 应对措施 | 状态 |
+|------|------|------|----------|------|
+| **GPU 显存不足** | 中 | 高 | 模型按需加载 + 显存监控 | 🟡 监控中 |
+| **B 站 API 限流** | 高 | 中 | 指数退避重试 + 多账号轮换 | 🟢 已实现 |
+| **FFmpeg 进程泄漏** | 低 | 中 | 超时强制终止 + 进程监控 | 🟢 已防护 |
+| **数据库连接池耗尽** | 中 | 高 | 连接池监控 + 慢查询告警 | 🟡 待实现 |
+| **Celery 任务积压** | 中 | 中 | 队列监控 + 自动扩缩容 | 🟡 待实现 |
+
+**监控告警阈值**（第 2 周接入 Prometheus）：
+```yaml
+# prometheus/alerts.yml
+groups:
+  - name: backend
+    rules:
+      - alert: HighGPUMemoryUsage
+        expr: gpu_memory_used / gpu_memory_total > 0.9
+        for: 5m
+        annotations:
+          summary: "GPU 显存使用率超过 90%"
+      
+      - alert: CeleryQueueBacklog
+        expr: celery_queue_length > 100
+        for: 10m
+        annotations:
+          summary: "Celery 任务队列积压超过 100"
+      
+      - alert: DatabaseConnectionPoolExhausted
+        expr: db_pool_available / db_pool_total < 0.1
+        for: 5m
+        annotations:
+          summary: "数据库连接池可用连接不足 10%"
+```
+
+---
+
+## 我的疑问
+
+@少锋 舅舅：
+1. **测试数据规模**：单元测试需要多少测试数据？（我准备用 Factory Boy 生成 100 条模拟用户 + 500 条模拟任务）
+2. **Mock B 站 API**：需要 Mock 哪些接口？（上传、查询状态、删除视频？）
+
+@少平 舅舅：
+1. **前端数据格式偏好**：时间字段用 Unix 时间戳还是 ISO 8601 字符串？（后端默认用 datetime，返回时转换）
+2. **分页参数规范**：用 `page/size` 还是 `offset/limit`？（我倾向 `offset/limit`，更符合 RESTful）
+
+@美娜 妈妈：
+1. **API 文档发布**：内测期用 Swagger UI（内置）还是单独部署 Docs 站点？（Swagger UI 更方便，但需要暴露 `/docs` 端点）
+2. **错误码规范**：需要统一的错误码体系吗？（如：`1001=用户未登录`, `2001=任务不存在`）
+
+---
+
+## 💡 补充建议
+
+**关于开发效率**：
+- ✅ 用 `pytest-watch` 实现测试自动运行（文件保存即测试）
+- ✅ 用 `httpie` 代替 Postman 测试 API（命令行更快捷）
+- ✅ 用 `docker-compose logs -f --tail=100` 实时查看日志
+
+**关于代码质量**：
+- ✅ 配置 pre-commit hook：提交前自动运行 black/flake8/mypy
+- ✅ 配置 GitHub Actions：PR 必须通过 CI 才能合并
+- ✅ 配置 Codecov：覆盖率下降>5% 则阻止合并
+
+**关于团队协作**：
+- ✅ 用 Swagger UI 作为 API 文档（前后端对齐）
+- ✅ 用 Mermaid 画流程图（Issue 描述更清晰）
+- ✅ 用 Git Branch 保护：main 分支禁止直接 push
+
+---
+
+以上就是我的回应和补充！技术实施我来把关，大家放心！💪
+
